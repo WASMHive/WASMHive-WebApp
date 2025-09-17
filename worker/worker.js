@@ -88,7 +88,10 @@ function createConnection(peerId) {
     });
     peerConnections[peerId] = pc;
 
-    const dc = pc.createDataChannel("computation");
+    const dc = pc.createDataChannel("computation", {
+        ordered: true,
+        maxRetransmits: 3
+    });
     setupDataChannel(dc, peerId);
 
     pc.onicecandidate = (event) => {
@@ -187,11 +190,13 @@ function setupDataChannel(channel, peerId) {
             try {
                 const msg = JSON.parse(event.data);
                 console.log(`📨 Parsed message:`, msg);
+                console.log(`🔍 Debug - msg.type: "${msg.type}", msg.task_id: "${msg.task_id}", msg.data_chunk exists: ${!!msg.data_chunk}, msg.map_function: "${msg.map_function}"`);
+
                 if (msg.type === "computeTask") {
-                    console.log(`⚡ Executing computeTask...`);
+                    console.log(`⚡ Executing computeTask (OLD FORMAT)...`);
                     await handleComputeTask(msg, peerId);
                 } else if (msg.task_id && msg.data_chunk) {
-                    console.log(`⚡ Executing Rust WebRTC task...`);
+                    console.log(`⚡ Executing Rust WebRTC task (NEW FORMAT)...`);
                     // Handle Rust WebRTC task format
                     await handleRustWebRTCTask(msg, channel);
                 } else {
@@ -272,11 +277,39 @@ function base64ToArrayBuffer(base64) {
     return bytes.buffer;
 }
 
-// Load WASM module from base64 data
-async function loadWasmModule(wasmBase64) {
-    const wasmBuffer = base64ToArrayBuffer(wasmBase64);
-    const wasmModule = await WebAssembly.instantiate(wasmBuffer);
-    return wasmModule;
+// Load separate WASM module and JS glue
+async function loadSeparateWasmModule(wasmBytes, jsGlue) {
+    try {
+        console.log("🔧 Loading separate WASM module and JS glue...");
+
+        // Create a blob URL for the JS glue code
+        const jsBlob = new Blob([jsGlue], { type: 'application/javascript' });
+        const jsUrl = URL.createObjectURL(jsBlob);
+
+        // Import the JS module
+        const wasmModule = await import(jsUrl);
+
+        // Initialize the WASM module with the raw bytes
+        // Try different initialization methods based on wasm-bindgen version
+        if (typeof wasmModule.default === 'function') {
+            // Modern wasm-bindgen: default export is the init function
+            await wasmModule.default(wasmBytes);
+        } else if (typeof wasmModule.init === 'function') {
+            // Alternative: init function exists
+            await wasmModule.init(wasmBytes);
+        } else {
+            // Try manual WebAssembly instantiation
+            const wasmWebAssembly = await WebAssembly.instantiate(wasmBytes);
+            // This won't have the JS wrapper functions, so this approach won't work
+            throw new Error("Unable to initialize WASM module - no suitable init method found");
+        }
+
+        console.log("✅ Separate WASM module loaded successfully");
+        return wasmModule;
+    } catch (error) {
+        console.error("❌ Failed to load separate WASM module:", error);
+        throw error;
+    }
 }
 
 // Handle compute task received from master
@@ -284,34 +317,85 @@ async function handleComputeTask(msg, peerId) {
     console.log("Received compute task from", peerId, msg);
 
     try {
-        let result = [];
+        console.log("🦀 Executing separate WASM computation...");
 
-        // Check if we have a valid WASM module or fallback to JavaScript
-        if (msg.wasmBase64 && msg.wasmBase64 !== "dummy") {
-            try {
-                // Load and use WASM module
-                const wasmModule = await loadWasmModule(msg.wasmBase64);
+        // Load separate WASM module and JS glue
+        const wasmModule = await loadSeparateWasmModule(new Uint8Array(msg.wasm_module), msg.js_glue);
 
-                // Execute based on execution mode
-                if (msg.executionMode === "cpu") {
-                    msg.dataChunk.forEach((num) => {
-                        result.push(wasmModule.instance.exports.map(num));
-                    });
-                } else if (msg.executionMode === "gpu") {
-                    console.log("GPU execution requested, falling back to CPU with WASM");
-                    msg.dataChunk.forEach((num) => {
-                        result.push(wasmModule.instance.exports.map(num));
-                    });
+        let result;
+
+        // NEW FORMAT: Use map_function field directly (preferred)
+        if (msg.map_function) {
+            console.log(`🔄 Using NEW format with map_function: ${msg.map_function}`);
+            const mapFunction = msg.map_function; // "cpu_map" or "gpu_map"
+
+            if (mapFunction === "cpu_map") {
+                // Execute cpu_map on each element
+                result = [];
+                for (const num of msg.data_chunk || msg.dataChunk) {
+                    const mapped = wasmModule.cpu_map(num);
+                    result.push(mapped);
                 }
-            } catch (wasmError) {
-                console.log("WASM execution failed, falling back to JavaScript:", wasmError.message);
-                result = executeJavaScriptFallback(msg.dataChunk, msg.executionMode);
+            } else if (mapFunction === "gpu_map") {
+                // Execute gpu_map on each element (same as cpu_map for consistency)
+                result = [];
+                for (const num of msg.data_chunk || msg.dataChunk) {
+                    const mapped = wasmModule.gpu_map(num);
+                    result.push(mapped);
+                }
+            } else {
+                throw new Error(`Unknown map function: ${mapFunction}`);
             }
+
+            console.log(`✅ NEW format WASM execution completed. Input: [${(msg.data_chunk || msg.dataChunk).join(',')}] -> Output: [${result.join(',')}]`);
         } else {
-            // Use JavaScript fallback for computation
-            console.log("Using JavaScript fallback for computation");
-            result = executeJavaScriptFallback(msg.dataChunk, msg.executionMode);
+            // OLD FORMAT: Legacy execution mode logic (fallback)
+            console.log(`⚠️ Using OLD format with execution_mode`);
+            const executionMode = msg.execution_mode || msg.executionMode || "CPU";
+            const baseFunctionName = msg.function_name || msg.functionName || "simple_map_reduce";
+            let functionName;
+
+            if (executionMode === "GPU") {
+                functionName = `${baseFunctionName}_gpu_wasm`;
+
+                if (!wasmModule[functionName]) {
+                    throw new Error(`Function ${functionName} not found in WASM module`);
+                }
+
+                // Prepare input for GPU WASM function (expects JSON string)
+                const input = {
+                    numbers: msg.data_chunk || msg.dataChunk,
+                    execution_mode: executionMode
+                };
+                const inputJson = JSON.stringify(input);
+
+                // Call GPU WASM function (async) and parse result
+                const resultJson = await wasmModule[functionName](inputJson);
+                const parsedResult = JSON.parse(resultJson);
+                result = parsedResult.value;
+            } else {
+                // CPU execution
+                functionName = `${baseFunctionName}_wasm`;
+
+                if (!wasmModule[functionName]) {
+                    throw new Error(`Function ${functionName} not found in WASM module`);
+                }
+
+                // Prepare input for CPU WASM function (expects JSON string)
+                const input = {
+                    numbers: msg.data_chunk || msg.dataChunk,
+                    execution_mode: executionMode
+                };
+                const inputJson = JSON.stringify(input);
+
+                // Call CPU WASM function and parse result
+                const resultJson = wasmModule[functionName](inputJson);
+                const parsedResult = JSON.parse(resultJson);
+                result = parsedResult.value;
+            }
         }
+
+        console.log("✅ Separate WASM execution completed successfully");
 
         // Add to compute history
         addToComputeHistory({
@@ -319,7 +403,7 @@ async function handleComputeTask(msg, peerId) {
             dataChunk: msg.dataChunk || msg.data_chunk,
             result: result,
             mode: msg.execution_mode || msg.executionMode || "CPU",
-            communication: msg.wasmBase64 === "dummy" ? "JavaScript WebRTC" : "WASM WebRTC"
+            communication: "Separate WASM"
         });
 
         // Send result back to master
@@ -332,26 +416,17 @@ async function handleComputeTask(msg, peerId) {
 
         if (dataChannels[peerId] && dataChannels[peerId].readyState === "open") {
             dataChannels[peerId].send(JSON.stringify(resultMessage));
-            console.log("Sent compute result:", resultMessage);
+            console.log("✅ Sent compute result:", resultMessage);
         }
 
     } catch (error) {
-        console.error("Error processing compute task:", error);
+        console.error("❌ Error processing compute task:", error);
 
-        // Fallback calculation even on error
-        let fallbackResult = [];
-        try {
-            fallbackResult = executeJavaScriptFallback(msg.dataChunk, msg.executionMode);
-        } catch (fallbackError) {
-            console.error("Fallback calculation also failed:", fallbackError);
-            fallbackResult = msg.dataChunk.map(() => 0); // Zero result as last resort
-        }
-
-        // Send error back to master with fallback result
+        // Send error back to master (no fallback - require WASM)
         const errorMessage = {
-            type: "computeResult", // Still send as result to keep the system working
+            type: "computeResult",
             taskId: msg.taskId,
-            result: fallbackResult,
+            result: [],
             workerId: myId,
             error: error.message
         };
@@ -362,58 +437,21 @@ async function handleComputeTask(msg, peerId) {
     }
 }
 
-// JavaScript fallback computation (sum of squares for the simple_map_reduce example)
-function executeJavaScriptFallback(dataChunk, executionMode) {
-    console.log(`Executing JavaScript fallback in ${executionMode} mode`);
-
-    // For the simple_map_reduce example, calculate square of each number
-    return dataChunk.map(num => num * num);
-}
-
-// Handle direct task from master via WebSocket (simplified communication)
+// Handle direct task from master via WebSocket (legacy - should use WebRTC)
 async function handleDirectTask(msg) {
-    console.log("Received direct task from master:", msg);
+    console.log("⚠️ Received direct task via WebSocket - this should use WebRTC instead");
 
-    try {
-        // Execute computation on the data chunk
-        const result = executeJavaScriptFallback(msg.dataChunk, "cpu");
+    // Send error back indicating WebRTC should be used
+    const errorMessage = {
+        type: "taskResult",
+        to: msg.from,
+        taskId: msg.taskId,
+        result: [],
+        error: "Direct WebSocket tasks not supported - use WebRTC with WASM",
+        workerId: myId
+    };
 
-        // Add to compute history
-        addToComputeHistory({
-            taskId: msg.taskId,
-            dataChunk: msg.dataChunk,
-            result: result,
-            mode: "CPU",
-            communication: "Direct WebSocket"
-        });
-
-        // Send result back to master via WebSocket
-        const resultMessage = {
-            type: "taskResult",
-            to: msg.from,
-            taskId: msg.taskId,
-            result: result,
-            workerId: myId
-        };
-
-        ws.send(JSON.stringify(resultMessage));
-        console.log("Sent result to master:", resultMessage);
-
-    } catch (error) {
-        console.error("Error processing direct task:", error);
-
-        // Send error back to master
-        const errorMessage = {
-            type: "taskResult",
-            to: msg.from,
-            taskId: msg.taskId,
-            result: [],
-            error: error.message,
-            workerId: myId
-        };
-
-        ws.send(JSON.stringify(errorMessage));
-    }
+    ws.send(JSON.stringify(errorMessage));
 }
 
 // Handle Rust WebRTC task format
@@ -421,16 +459,47 @@ async function handleRustWebRTCTask(msg, channel) {
     console.log("🦀 Worker received Rust WebRTC task:", msg);
 
     try {
-        // Execute computation on the data chunk (sum of squares)
-        const result = msg.data_chunk.map(num => num * num);
+        console.log("🔧 Loading WASM module and executing map function...");
+
+        // Decode base64 WASM module
+        const wasmBytes = base64ToArrayBuffer(msg.wasm_module);
+
+        // Load WASM module with JS glue
+        const wasmModule = await loadSeparateWasmModule(wasmBytes, msg.js_glue);
+
+        // Determine which WASM function to call
+        const mapFunction = msg.map_function; // "cpu_map" or "gpu_map"
+        console.log(`📊 Executing WASM function: ${mapFunction}`);
+
+        let result;
+
+        if (mapFunction === "cpu_map") {
+            // Execute cpu_map on each element
+            result = [];
+            for (const num of msg.data_chunk) {
+                const mapped = wasmModule.cpu_map(num);
+                result.push(mapped);
+            }
+        } else if (mapFunction === "gpu_map") {
+            // Execute gpu_map on each element (same as cpu_map for consistency)
+            result = [];
+            for (const num of msg.data_chunk) {
+                const mapped = wasmModule.gpu_map(num);
+                result.push(mapped);
+            }
+        } else {
+            throw new Error(`Unknown map function: ${mapFunction}`);
+        }
+
+        console.log(`✅ WASM execution completed. Input: [${msg.data_chunk.join(',')}] -> Output: [${result.join(',')}]`);
 
         // Add to compute history
         addToComputeHistory({
             taskId: msg.task_id,
             dataChunk: msg.data_chunk,
             result: result,
-            mode: msg.execution_mode || "CPU",
-            communication: "Rust WebRTC"
+            mode: mapFunction,
+            communication: "WASM " + mapFunction
         });
 
         // Send result back via WebRTC data channel
@@ -441,10 +510,10 @@ async function handleRustWebRTCTask(msg, channel) {
         };
 
         channel.send(JSON.stringify(resultMessage));
-        console.log("Sent result via WebRTC:", resultMessage);
+        console.log("✅ Sent WASM result via WebRTC:", resultMessage);
 
     } catch (error) {
-        console.error("Error processing Rust WebRTC task:", error);
+        console.error("❌ Error processing WASM task:", error);
 
         // Send error back
         const errorMessage = {
