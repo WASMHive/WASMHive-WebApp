@@ -1,0 +1,15 @@
+{
+  "name": "distributed-compute-system",
+  "version": "1.0.0",
+  "description": "Distributed computing system with WebRTC workers",
+  "main": "websocket-server.js",
+  "scripts": {
+    "start": "node websocket-server.js",
+    "server": "node websocket-server.js"
+  },
+  "dependencies": {
+    "ws": "^8.14.2"
+  },
+  "author": "",
+  "license": "MIT"
+}
