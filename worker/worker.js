@@ -327,7 +327,7 @@ async function handleComputeTask(msg, peerId) {
         // NEW FORMAT: Use map_function field directly (preferred)
         if (msg.map_function) {
             console.log(`🔄 Using NEW format with map_function: ${msg.map_function}`);
-            const mapFunction = msg.map_function; // "cpu_map" or "gpu_map"
+            const mapFunction = msg.map_function; // "cpu_map", "gpu_map", or "cpu1_map"
 
             if (mapFunction === "cpu_map") {
                 // Execute cpu_map on each element
@@ -341,6 +341,13 @@ async function handleComputeTask(msg, peerId) {
                 result = [];
                 for (const num of msg.data_chunk || msg.dataChunk) {
                     const mapped = wasmModule.gpu_map(num);
+                    result.push(mapped);
+                }
+            } else if (mapFunction === "cpu1_map") {
+                // Execute cpu1_map on each element (x³)
+                result = [];
+                for (const num of msg.data_chunk || msg.dataChunk) {
+                    const mapped = wasmModule.cpu1_map(num);
                     result.push(mapped);
                 }
             } else {
@@ -468,7 +475,7 @@ async function handleRustWebRTCTask(msg, channel) {
         const wasmModule = await loadSeparateWasmModule(wasmBytes, msg.js_glue);
 
         // Determine which WASM function to call
-        const mapFunction = msg.map_function; // "cpu_map" or "gpu_map"
+        const mapFunction = msg.map_function; // "cpu_map", "gpu_map", or "cpu1_map"
         console.log(`📊 Executing WASM function: ${mapFunction}`);
 
         let result;
@@ -485,6 +492,13 @@ async function handleRustWebRTCTask(msg, channel) {
             result = [];
             for (const num of msg.data_chunk) {
                 const mapped = wasmModule.gpu_map(num);
+                result.push(mapped);
+            }
+        } else if (mapFunction === "cpu1_map") {
+            // Execute cpu1_map on each element (x³)
+            result = [];
+            for (const num of msg.data_chunk) {
+                const mapped = wasmModule.cpu1_map(num);
                 result.push(mapped);
             }
         } else {
