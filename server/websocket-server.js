@@ -1,21 +1,21 @@
 const WebSocket = require("ws");
 
 const wss = new WebSocket.Server({ port: 3000 });
-let clients = {};
-let masters = {}; // Track master nodes separately
+let nodes = {};
+let clients = {}; // Track client nodes (task distributors) separately
 let workers = {}; // Track worker nodes separately
 
 wss.on("connection", (ws) => {
-  // Generate a unique ID for the client.
+  // Generate a unique ID for the node.
   const id = Math.random().toString(36).substr(2, 9);
-  clients[id] = { ws, type: "unknown" }; // Default to unknown until identified
-  console.log(`Client connected: ${id}`);
+  nodes[id] = { ws, type: "unknown" }; // Default to unknown until identified
+  console.log(`Node connected: ${id}`);
 
-  // Send the welcome message with this client's ID.
+  // Send the welcome message with this node's ID.
   ws.send(JSON.stringify({ type: "welcome", id }));
 
-  // Initially treat as worker until master identifies itself
-  workers[id] = clients[id];
+  // Initially treat as worker until client identifies itself
+  workers[id] = nodes[id];
 
   // Broadcast the updated peer list to everyone.
   broadcastPeerList();
@@ -23,11 +23,11 @@ wss.on("connection", (ws) => {
   ws.on("message", (message) => {
     const data = JSON.parse(message);
 
-    // Handle master registration
+    // Handle client registration (task distributor)
     if (data.type === "registerMaster") {
-      console.log(`Client ${id} registered as MASTER`);
-      clients[id].type = "master";
-      masters[id] = clients[id];
+      console.log(`Node ${id} registered as CLIENT`);
+      nodes[id].type = "client";
+      clients[id] = nodes[id];
       delete workers[id]; // Remove from workers list
       broadcastPeerList(); // Update peer lists
       return;
@@ -35,38 +35,38 @@ wss.on("connection", (ws) => {
 
     // Handle worker registration (explicit)
     if (data.type === "registerWorker") {
-      console.log(`Client ${id} registered as WORKER`);
-      clients[id].type = "worker";
-      workers[id] = clients[id];
-      delete masters[id]; // Remove from masters list if it was there
+      console.log(`Node ${id} registered as WORKER`);
+      nodes[id].type = "worker";
+      workers[id] = nodes[id];
+      delete clients[id]; // Remove from clients list if it was there
       broadcastPeerList(); // Update peer lists
       return;
     }
 
-    // Relay messages between clients.
-    if (data.to && clients[data.to]) {
-      clients[data.to].ws.send(JSON.stringify({ ...data, from: id }));
+    // Relay messages between nodes.
+    if (data.to && nodes[data.to]) {
+      nodes[data.to].ws.send(JSON.stringify({ ...data, from: id }));
     }
   });
 
   ws.on("close", () => {
-    console.log(`Client disconnected: ${id} (type: ${clients[id]?.type || "unknown"})`);
+    console.log(`Node disconnected: ${id} (type: ${nodes[id]?.type || "unknown"})`);
+    delete nodes[id];
     delete clients[id];
-    delete masters[id];
     delete workers[id];
     broadcastPeerList();
   });
 });
 
-// Broadcast the list of worker IDs only (exclude masters from peer discovery).
+// Broadcast the list of worker IDs only (exclude clients from peer discovery).
 function broadcastPeerList() {
   const workerList = Object.keys(workers);
-  const masterList = Object.keys(masters);
-  console.log(`Broadcasting peer list - Workers: [${workerList.join(', ')}], Masters: [${masterList.join(', ')}]`);
+  const clientList = Object.keys(clients);
+  console.log(`Broadcasting peer list - Workers: [${workerList.join(', ')}], Clients: [${clientList.join(', ')}]`);
 
   const message = JSON.stringify({ type: "peerList", peers: workerList });
-  for (const clientId in clients) {
-    clients[clientId].ws.send(message);
+  for (const nodeId in nodes) {
+    nodes[nodeId].ws.send(message);
   }
 }
 

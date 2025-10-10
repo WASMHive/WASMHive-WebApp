@@ -1,4 +1,4 @@
-// Worker Node - receives compute tasks and WASM modules from master via WebRTC
+// Worker Node - receives compute tasks and WASM modules from clients via WebRTC
 let ws = new WebSocket("ws://localhost:3000");
 let myId;
 let peerConnections = {}; // { peerId: RTCPeerConnection }
@@ -78,7 +78,7 @@ function updatePeerList(peers) {
 
     console.log("Worker updating peer list, others:", others);
 
-    // Workers connect to all other peers (masters and workers)
+    // Workers connect to all other peers (clients and workers)
     others.forEach((peerId) => {
         if (!peerConnections[peerId]) {
             console.log("Worker initiating connection to", peerId);
@@ -399,7 +399,7 @@ async function loadSeparateWasmModule(wasmBytes, jsGlue) {
     }
 }
 
-// Handle compute task received from master
+// Handle compute task received from client
 async function handleComputeTask(msg, peerId) {
     console.log("Received compute task from", peerId, msg);
 
@@ -493,7 +493,7 @@ async function handleComputeTask(msg, peerId) {
             communication: "Separate WASM"
         });
 
-        // Send result back to master
+        // Send result back to client
         const resultMessage = {
             type: "computeResult",
             taskId: msg.taskId,
@@ -509,7 +509,7 @@ async function handleComputeTask(msg, peerId) {
     } catch (error) {
         console.error("❌ Error processing compute task:", error);
 
-        // Send error back to master (no fallback - require WASM)
+        // Send error back to client (no fallback - require WASM)
         const errorMessage = {
             type: "computeResult",
             taskId: msg.taskId,
@@ -524,7 +524,7 @@ async function handleComputeTask(msg, peerId) {
     }
 }
 
-// Handle direct task from master via WebSocket (legacy - should use WebRTC)
+// Handle direct task from client via WebSocket (legacy - should use WebRTC)
 async function handleDirectTask(msg) {
     console.log("⚠️ Received direct task via WebSocket - this should use WebRTC instead");
 
