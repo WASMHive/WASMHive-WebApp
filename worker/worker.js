@@ -6,6 +6,9 @@ let dataChannels = {}; // { peerId: RTCDataChannel }
 let connectedPeers = {}; // { peerId: true } when data channel is open
 let computeHistory = []; // Store compute task history
 
+// Chunk reassembly buffer: { chunk_id: { chunks: Map<index, data>, total_chunks, received_chunks } }
+let chunkBuffers = {};
+
 // WebSocket connection setup
 ws.onopen = () => {
     console.log("Worker connected to WebSocket server");
@@ -185,10 +188,83 @@ function setupDataChannel(channel, peerId) {
     };
 
     channel.onmessage = async (event) => {
-        console.log(`🔔 Worker ${myId} received data channel message from ${peerId}:`, event.data);
+        console.log(`🔔 Worker ${myId} received data channel message from ${peerId}`);
+        console.log(`   📏 Message length: ${event.data.length} bytes`);
+        console.log(`   📝 First 200 chars:`, event.data.substring(0, 200));
+
         if (typeof event.data === "string") {
             try {
                 const msg = JSON.parse(event.data);
+                console.log(`   ✅ Parsed JSON successfully`);
+                console.log(`   🔑 Message keys:`, Object.keys(msg));
+
+                // Check if this is a chunk message
+                if (msg.chunk_id !== undefined && msg.chunk_index !== undefined && msg.total_chunks !== undefined) {
+                    console.log(`📦 Received chunk ${msg.chunk_index + 1}/${msg.total_chunks} for ${msg.chunk_id}`);
+
+                    // Initialize buffer for this chunk_id if needed
+                    if (!chunkBuffers[msg.chunk_id]) {
+                        chunkBuffers[msg.chunk_id] = {
+                            chunks: new Map(),
+                            total_chunks: msg.total_chunks,
+                            received_chunks: 0
+                        };
+                    }
+
+                    // Store this chunk
+                    const buffer = chunkBuffers[msg.chunk_id];
+                    buffer.chunks.set(msg.chunk_index, msg.data);
+                    buffer.received_chunks++;
+
+                    console.log(`   📊 Buffer status: ${buffer.received_chunks}/${buffer.total_chunks} chunks received`);
+
+                    // Check if all chunks are received
+                    if (buffer.received_chunks === buffer.total_chunks) {
+                        console.log(`✅ All chunks received for ${msg.chunk_id}, reassembling...`);
+
+                        // Reassemble chunks in order
+                        let fullData = '';
+                        for (let i = 0; i < buffer.total_chunks; i++) {
+                            const chunkData = buffer.chunks.get(i);
+                            if (!chunkData) {
+                                console.error(`❌ Missing chunk ${i} for ${msg.chunk_id}`);
+                                delete chunkBuffers[msg.chunk_id];
+                                return;
+                            }
+                            // Decode base64 chunk
+                            const decodedChunk = atob(chunkData);
+                            fullData += decodedChunk;
+                        }
+
+                        console.log(`   📏 Reassembled message: ${fullData.length} bytes`);
+
+                        // Clean up chunk buffer
+                        delete chunkBuffers[msg.chunk_id];
+
+                        // Parse and process the reassembled message
+                        try {
+                            const reassembledMsg = JSON.parse(fullData);
+                            console.log(`📨 Parsed reassembled message`);
+
+                            // Process the reassembled message as normal
+                            if (reassembledMsg.type === "computeTask") {
+                                console.log(`⚡ Executing computeTask (OLD FORMAT)...`);
+                                await handleComputeTask(reassembledMsg, peerId);
+                            } else if (reassembledMsg.task_id && reassembledMsg.data_chunk) {
+                                console.log(`⚡ Executing Rust WebRTC task (NEW FORMAT)...`);
+                                await handleRustWebRTCTask(reassembledMsg, channel);
+                            } else {
+                                console.log(`❓ Unknown reassembled message type:`, reassembledMsg);
+                            }
+                        } catch (e) {
+                            console.error("❌ Error parsing reassembled message:", e);
+                        }
+                    }
+
+                    return; // Chunk message handled
+                }
+
+                // Not a chunk message, handle normally
                 console.log(`📨 Parsed message:`, msg);
                 console.log(`🔍 Debug - msg.type: "${msg.type}", msg.task_id: "${msg.task_id}", msg.data_chunk exists: ${!!msg.data_chunk}, msg.map_function: "${msg.map_function}"`);
 
@@ -337,12 +413,10 @@ async function handleComputeTask(msg, peerId) {
                     result.push(mapped);
                 }
             } else if (mapFunction === "gpu_map") {
-                // Execute gpu_map on each element (same as cpu_map for consistency)
-                result = [];
-                for (const num of msg.data_chunk || msg.dataChunk) {
-                    const mapped = wasmModule.gpu_map(num);
-                    result.push(mapped);
-                }
+                // Execute gpu_map with batch async WebGPU processing
+                const gpuResult = await wasmModule.gpu_map(msg.data_chunk || msg.dataChunk);
+                // Convert Float32Array to regular Array for JSON serialization
+                result = Array.isArray(gpuResult) ? gpuResult : Array.from(gpuResult);
             } else if (mapFunction === "cpu1_map") {
                 // Execute cpu1_map on each element (x³)
                 result = [];
@@ -355,6 +429,7 @@ async function handleComputeTask(msg, peerId) {
             }
 
             console.log(`✅ NEW format WASM execution completed. Input: [${(msg.data_chunk || msg.dataChunk).join(',')}] -> Output: [${result.join(',')}]`);
+            console.log(`   📊 Result type: ${typeof result}, Array: ${Array.isArray(result)}, Length: ${result?.length}`);
         } else {
             // OLD FORMAT: Legacy execution mode logic (fallback)
             console.log(`⚠️ Using OLD format with execution_mode`);
@@ -488,12 +563,8 @@ async function handleRustWebRTCTask(msg, channel) {
                 result.push(mapped);
             }
         } else if (mapFunction === "gpu_map") {
-            // Execute gpu_map on each element (same as cpu_map for consistency)
-            result = [];
-            for (const num of msg.data_chunk) {
-                const mapped = wasmModule.gpu_map(num);
-                result.push(mapped);
-            }
+            // Execute gpu_map with batch async WebGPU processing
+            result = await wasmModule.gpu_map(msg.data_chunk);
         } else if (mapFunction === "cpu1_map") {
             // Execute cpu1_map on each element (x³)
             result = [];
@@ -506,12 +577,17 @@ async function handleRustWebRTCTask(msg, channel) {
         }
 
         console.log(`✅ WASM execution completed. Input: [${msg.data_chunk.join(',')}] -> Output: [${result.join(',')}]`);
+        console.log(`   📊 Result type: ${typeof result}, Array: ${Array.isArray(result)}, Length: ${result?.length}`);
+
+        // Convert Float32Array or other typed arrays to regular Array for JSON serialization
+        const resultArray = Array.isArray(result) ? result : Array.from(result);
+        console.log(`   🔄 Converted to Array: ${Array.isArray(resultArray)}`);
 
         // Add to compute history
         addToComputeHistory({
             taskId: msg.task_id,
             dataChunk: msg.data_chunk,
-            result: result,
+            result: resultArray,
             mode: mapFunction,
             communication: "WASM " + mapFunction
         });
@@ -519,12 +595,20 @@ async function handleRustWebRTCTask(msg, channel) {
         // Send result back via WebRTC data channel
         const resultMessage = {
             task_id: msg.task_id,
-            result: result,
+            result: resultArray,
             worker_id: myId
         };
 
-        channel.send(JSON.stringify(resultMessage));
-        console.log("✅ Sent WASM result via WebRTC:", resultMessage);
+        console.log("📤 Preparing to send result back...");
+        console.log("   🔍 Result message:", resultMessage);
+        console.log("   🔍 Channel state:", channel.readyState);
+
+        try {
+            channel.send(JSON.stringify(resultMessage));
+            console.log("✅ Sent WASM result via WebRTC successfully!");
+        } catch (e) {
+            console.error("❌ Failed to send result:", e);
+        }
 
     } catch (error) {
         console.error("❌ Error processing WASM task:", error);
