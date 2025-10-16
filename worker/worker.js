@@ -6,6 +6,7 @@ let dataChannels = {}; // { peerId: RTCDataChannel }
 let connectedPeers = {}; // { peerId: true } when data channel is open
 let computeHistory = []; // Store compute task history
 let latestPeers = []; // Cache latest peer list for redraws
+let latestAllocation = null; // Cache latest allocation payload
 
 // SVG topology elements
 const networkSvg = document.getElementById("networkSvg");
@@ -29,6 +30,9 @@ ws.onmessage = (message) => {
     if (data.type === "peerList") {
         if (myId) updatePeerList(data.peers);
     }
+  if (data.type === "allocation") {
+      renderAllocation(data);
+  }
     if (data.type === "offer") {
         handleOffer(data);
     }
@@ -88,6 +92,42 @@ function updatePeerList(peers) {
 
 	// Redraw topology
 	drawNetwork(latestPeers);
+}
+
+// Render resource allocation summary
+function renderAllocation(payload) {
+    latestAllocation = payload;
+    const container = document.getElementById("allocationSummary");
+    if (!container) return;
+
+    const { allocation = {}, counts = {}, totalWorkers = 0, totalClients = 0 } = payload || {};
+
+    if (!totalClients) {
+        container.innerHTML = '<div class="history-message">No clients registered. All workers idle or awaiting tasks.</div>';
+        return;
+    }
+
+    const rows = Object.keys(allocation).sort().map((clientId) => {
+        const assigned = allocation[clientId] || [];
+        const count = counts[clientId] || 0;
+        const percentage = totalWorkers ? Math.round((count / totalWorkers) * 100) : 0;
+        return `
+            <div class="history-item">
+                <div class="history-timestamp">Client: ${clientId}</div>
+                <strong>Workers Assigned:</strong> ${count} / ${totalWorkers} (${percentage}%)<br>
+                <strong>Worker IDs:</strong> ${assigned.length ? assigned.join(', ') : '—'}
+            </div>
+        `;
+    }).join("");
+
+    const header = `
+        <div class="history-item">
+            <div class="history-timestamp">Allocation Policy: Fair Share (Round-Robin)</div>
+            <strong>Total Clients:</strong> ${totalClients} &nbsp; | &nbsp; <strong>Total Workers:</strong> ${totalWorkers}
+        </div>
+    `;
+
+    container.innerHTML = header + rows;
 }
 
 function createConnection(peerId) {

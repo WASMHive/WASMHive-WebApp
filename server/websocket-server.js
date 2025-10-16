@@ -64,10 +64,60 @@ function broadcastPeerList() {
   const clientList = Object.keys(clients);
   console.log(`Broadcasting peer list - Workers: [${workerList.join(', ')}], Clients: [${clientList.join(', ')}]`);
 
-  const message = JSON.stringify({ type: "peerList", peers: workerList });
   for (const nodeId in nodes) {
-    nodes[nodeId].ws.send(message);
+    const node = nodes[nodeId];
+    // Clients (masters) should only see workers; Workers should see workers + clients (so they can dial masters)
+    const peers = node.type === "client"
+      ? workerList
+      : Array.from(new Set([...workerList, ...clientList]));
+
+    node.ws.send(JSON.stringify({ type: "peerList", peers }));
   }
+
+  // Also broadcast fair-share allocation of workers to clients
+  const allocationPayload = computeFairShareAllocation();
+  for (const nodeId in nodes) {
+    const node = nodes[nodeId];
+    node.ws.send(JSON.stringify({ type: "allocation", ...allocationPayload }));
+  }
+}
+
+// Fair-share scheduling: distribute workers evenly across clients in round-robin order
+function computeFairShareAllocation() {
+  const workerList = Object.keys(workers);
+  const clientList = Object.keys(clients);
+
+  // Deterministic order for stability
+  clientList.sort();
+  workerList.sort();
+
+  /** @type {Record<string, string[]>} */
+  const allocation = {};
+  clientList.forEach((c) => (allocation[c] = []));
+
+  if (clientList.length === 0) {
+    return {
+      allocation,
+      counts: {},
+      totalWorkers: workerList.length,
+      totalClients: 0,
+    };
+  }
+
+  for (let i = 0; i < workerList.length; i++) {
+    const clientId = clientList[i % clientList.length];
+    allocation[clientId].push(workerList[i]);
+  }
+
+  const counts = {};
+  for (const c of clientList) counts[c] = allocation[c].length;
+
+  return {
+    allocation,
+    counts,
+    totalWorkers: workerList.length,
+    totalClients: clientList.length,
+  };
 }
 
 console.log("WebSocket server running on ws://localhost:3000");
