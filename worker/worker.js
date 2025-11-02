@@ -253,6 +253,9 @@ function setupDataChannel(channel, peerId) {
                             } else if (reassembledMsg.task_id && reassembledMsg.data_chunk) {
                                 console.log(`⚡ Executing Rust WebRTC task (NEW FORMAT)...`);
                                 await handleRustWebRTCTask(reassembledMsg, channel);
+                            } else if (reassembledMsg.task_id && reassembledMsg.data_chunk_b64) {
+                                console.log(`🧪 Executing byte-based Rust WebRTC task (BINARY FORMAT)...`);
+                                await handleRustWebRTCTaskBytes(reassembledMsg, channel);
                             } else {
                                 console.log(`❓ Unknown reassembled message type:`, reassembledMsg);
                             }
@@ -275,6 +278,9 @@ function setupDataChannel(channel, peerId) {
                     console.log(`⚡ Executing Rust WebRTC task (NEW FORMAT)...`);
                     // Handle Rust WebRTC task format
                     await handleRustWebRTCTask(msg, channel);
+                } else if (msg.task_id && msg.data_chunk_b64) {
+                    console.log(`🧪 Executing byte-based Rust WebRTC task (BINARY FORMAT)...`);
+                    await handleRustWebRTCTaskBytes(msg, channel);
                 } else {
                     console.log(`❓ Unknown message type:`, msg);
                 }
@@ -621,6 +627,81 @@ async function handleRustWebRTCTask(msg, channel) {
             worker_id: myId
         };
 
+        channel.send(JSON.stringify(errorMessage));
+    }
+}
+
+// Handle byte-based Rust WebRTC task format (e.g., video frames)
+async function handleRustWebRTCTaskBytes(msg, channel) {
+    console.log("🦀 Worker received Rust WebRTC BYTE task:", msg);
+
+    try {
+        console.log("🔧 Loading WASM module and executing byte map function...");
+
+        // Decode base64 WASM module
+        const wasmBytes = base64ToArrayBuffer(msg.wasm_module);
+
+        // Load WASM module with JS glue
+        const wasmModule = await loadSeparateWasmModule(wasmBytes, msg.js_glue);
+
+        // Decode data chunk
+        const chunkArrayBuffer = base64ToArrayBuffer(msg.data_chunk_b64);
+        const chunkBytes = new Uint8Array(chunkArrayBuffer);
+
+        // Determine function
+        const mapFunction = msg.map_function;
+        if (!wasmModule[mapFunction]) {
+            throw new Error(`Unknown byte map function: ${mapFunction}`);
+        }
+
+        let resultBytes;
+        // Try calling with (bytes, meta); extra args are ignored if not needed
+        const possible = wasmModule[mapFunction](chunkBytes, msg.meta);
+        if (possible instanceof Promise) {
+            resultBytes = await possible;
+        } else {
+            resultBytes = possible;
+        }
+
+        // Ensure Uint8Array
+        if (!(resultBytes instanceof Uint8Array)) {
+            if (ArrayBuffer.isView(resultBytes)) {
+                resultBytes = new Uint8Array(resultBytes.buffer);
+            } else if (resultBytes instanceof ArrayBuffer) {
+                resultBytes = new Uint8Array(resultBytes);
+            } else {
+                throw new Error("Byte map function did not return a byte buffer");
+            }
+        }
+
+        // Encode result as base64
+        const binary = String.fromCharCode.apply(null, resultBytes);
+        const resultB64 = btoa(binary);
+
+        // Send result back with meta echoed
+        const resultMessage = {
+            task_id: msg.task_id,
+            result_b64: resultB64,
+            worker_id: myId,
+            meta: msg.meta || null,
+        };
+
+        try {
+            channel.send(JSON.stringify(resultMessage));
+            console.log("✅ Sent BYTE result via WebRTC successfully!");
+        } catch (e) {
+            console.error("❌ Failed to send BYTE result:", e);
+        }
+
+    } catch (error) {
+        console.error("❌ Error processing BYTE WASM task:", error);
+        const errorMessage = {
+            task_id: msg.task_id,
+            result_b64: "",
+            error: error.message,
+            worker_id: myId,
+            meta: msg.meta || null,
+        };
         channel.send(JSON.stringify(errorMessage));
     }
 }
