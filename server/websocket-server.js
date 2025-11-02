@@ -58,13 +58,14 @@ wss.on("connection", (ws) => {
   });
 });
 
-// Broadcast the list of worker IDs only (exclude masters from peer discovery).
+// Broadcast the list of all peer IDs (masters + workers) so workers can discover masters
 function broadcastPeerList() {
   const workerList = Object.keys(workers);
   const masterList = Object.keys(masters);
+  const allPeers = Object.keys(clients);
   console.log(`Broadcasting peer list - Workers: [${workerList.join(', ')}], Masters: [${masterList.join(', ')}]`);
 
-  const message = JSON.stringify({ type: "peerList", peers: workerList });
+  const message = JSON.stringify({ type: "peerList", peers: allPeers });
   for (const clientId in clients) {
     clients[clientId].ws.send(message);
   }

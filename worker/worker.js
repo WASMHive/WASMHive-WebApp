@@ -5,6 +5,7 @@ let peerConnections = {}; // { peerId: RTCPeerConnection }
 let dataChannels = {}; // { peerId: RTCDataChannel }
 let connectedPeers = {}; // { peerId: true } when data channel is open
 let computeHistory = []; // Store compute task history
+let wasmCache = {}; // { mapFunction: wasmModule }
 
 // Chunk reassembly buffer: { chunk_id: { chunks: Map<index, data>, total_chunks, received_chunks } }
 let chunkBuffers = {};
@@ -91,9 +92,9 @@ function createConnection(peerId) {
     });
     peerConnections[peerId] = pc;
 
+    // Reliable, ordered channel for large transfers
     const dc = pc.createDataChannel("computation", {
-        ordered: true,
-        maxRetransmits: 3
+        ordered: true
     });
     setupDataChannel(dc, peerId);
 
@@ -357,6 +358,75 @@ function base64ToArrayBuffer(base64) {
         bytes[i] = binary_string.charCodeAt(i);
     }
     return bytes.buffer;
+}
+
+// Helper: Convert Uint8Array to Base64 without stack overflow
+function uint8ToBase64(bytes) {
+    const chunkSize = 0x8000; // 32KB per chunk
+    let binary = '';
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+        const sub = bytes.subarray(i, i + chunkSize);
+        binary += String.fromCharCode.apply(null, sub);
+    }
+    return btoa(binary);
+}
+
+// Encode RGBA bytes to PNG (base64) using Canvas/OffscreenCanvas
+async function rgbaToPngBase64(rgbaBytes, width, height) {
+    try {
+        // Validate buffer size
+        const expectedSize = width * height * 4;
+        if (rgbaBytes.length !== expectedSize) {
+            console.warn(`⚠️ Buffer size mismatch: expected ${expectedSize}, got ${rgbaBytes.length}`);
+            // Try to adjust if buffer is larger (might have padding)
+            if (rgbaBytes.length > expectedSize) {
+                rgbaBytes = rgbaBytes.slice(0, expectedSize);
+            } else {
+                throw new Error(`Buffer too small: ${rgbaBytes.length} < ${expectedSize}`);
+            }
+        }
+
+        let canvas;
+        let ctx;
+        if (typeof OffscreenCanvas !== 'undefined') {
+            canvas = new OffscreenCanvas(width, height);
+            ctx = canvas.getContext('2d');
+        } else {
+            const c = document.createElement('canvas');
+            c.width = width;
+            c.height = height;
+            canvas = c;
+            ctx = canvas.getContext('2d');
+        }
+
+        const imageData = new ImageData(width, height);
+        imageData.data.set(rgbaBytes);
+        ctx.putImageData(imageData, 0, 0);
+
+        const blob = await new Promise((resolve) => {
+            if (canvas.convertToBlob) {
+                canvas.convertToBlob({ type: 'image/png' }).then(resolve);
+            } else {
+                canvas.toBlob(resolve, 'image/png');
+            }
+        });
+        const arrayBuffer = await blob.arrayBuffer();
+        return uint8ToBase64(new Uint8Array(arrayBuffer));
+    } catch (e) {
+        console.error('PNG encode failed, returning raw base64 as fallback', e);
+        return uint8ToBase64(rgbaBytes);
+    }
+}
+
+// Helper: Convert Uint8Array to Base64 without stack overflow
+function uint8ToBase64(bytes) {
+    const chunkSize = 0x8000; // 32KB per chunk
+    let binary = '';
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+        const sub = bytes.subarray(i, i + chunkSize);
+        binary += String.fromCharCode.apply(null, sub);
+    }
+    return btoa(binary);
 }
 
 // Load separate WASM module and JS glue
@@ -634,33 +704,52 @@ async function handleRustWebRTCTask(msg, channel) {
 // Handle byte-based Rust WebRTC task format (e.g., video frames)
 async function handleRustWebRTCTaskBytes(msg, channel) {
     console.log("🦀 Worker received Rust WebRTC BYTE task:", msg);
+    console.log("   📏 Meta:", msg.meta);
 
     try {
         console.log("🔧 Loading WASM module and executing byte map function...");
 
-        // Decode base64 WASM module
-        const wasmBytes = base64ToArrayBuffer(msg.wasm_module);
-
-        // Load WASM module with JS glue
-        const wasmModule = await loadSeparateWasmModule(wasmBytes, msg.js_glue);
+        // Load or reuse WASM module if needed
+        const mapFunction = msg.map_function;
+        let wasmModule = wasmCache[mapFunction];
+        if (!wasmModule && mapFunction !== 'grayscale_frame_js') {
+            const wasmBytes = base64ToArrayBuffer(msg.wasm_module || "");
+            if (wasmBytes && wasmBytes.byteLength > 0) {
+                wasmModule = await loadSeparateWasmModule(wasmBytes, msg.js_glue || "");
+                wasmCache[mapFunction] = wasmModule;
+            }
+        }
 
         // Decode data chunk
         const chunkArrayBuffer = base64ToArrayBuffer(msg.data_chunk_b64);
         const chunkBytes = new Uint8Array(chunkArrayBuffer);
 
         // Determine function
-        const mapFunction = msg.map_function;
-        if (!wasmModule[mapFunction]) {
+        if (mapFunction !== 'grayscale_frame_js' && (!wasmModule || !wasmModule[mapFunction])) {
             throw new Error(`Unknown byte map function: ${mapFunction}`);
         }
 
         let resultBytes;
-        // Try calling with (bytes, meta); extra args are ignored if not needed
-        const possible = wasmModule[mapFunction](chunkBytes, msg.meta);
-        if (possible instanceof Promise) {
-            resultBytes = await possible;
+        if (mapFunction === 'grayscale_frame_js') {
+            // JS fallback grayscale: in-place over RGBA
+            resultBytes = chunkBytes.slice();
+            for (let i = 0; i + 3 < resultBytes.length; i += 4) {
+                const r = resultBytes[i];
+                const g = resultBytes[i+1];
+                const b = resultBytes[i+2];
+                const gray = (0.299*r + 0.587*g + 0.114*b) | 0;
+                resultBytes[i] = gray;
+                resultBytes[i+1] = gray;
+                resultBytes[i+2] = gray;
+            }
         } else {
-            resultBytes = possible;
+            // Try calling with (bytes, meta); extra args are ignored if not needed
+            const possible = wasmModule[mapFunction](chunkBytes, msg.meta);
+            if (possible instanceof Promise) {
+                resultBytes = await possible;
+            } else {
+                resultBytes = possible;
+            }
         }
 
         // Ensure Uint8Array
@@ -674,21 +763,39 @@ async function handleRustWebRTCTaskBytes(msg, channel) {
             }
         }
 
-        // Encode result as base64
-        const binary = String.fromCharCode.apply(null, resultBytes);
-        const resultB64 = btoa(binary);
+        // Encode result as PNG base64 to reduce payload size
+        const w = (msg.meta && msg.meta.width) || 0;
+        const h = (msg.meta && msg.meta.height) || 0;
+        console.log(`   🖼️  Encoding PNG: ${w}x${h}, bytes: ${resultBytes.length}`);
+        const resultB64 = await rgbaToPngBase64(resultBytes, w, h);
+        console.log(`   📦 PNG base64 length: ${resultB64.length}`);
 
         // Send result back with meta echoed
         const resultMessage = {
             task_id: msg.task_id,
             result_b64: resultB64,
             worker_id: myId,
-            meta: msg.meta || null,
+            meta: Object.assign({}, msg.meta || null, { format: 'png' }),
         };
 
+        // Wait for send queue to drain before sending large result
+        const resultJson = JSON.stringify(resultMessage);
+        const maxBuffered = 16 * 1024 * 1024; // 16MB
+        while (channel.bufferedAmount > maxBuffered) {
+            console.log(`   ⏳ Waiting for send queue to drain (${channel.bufferedAmount} bytes buffered)...`);
+            await new Promise(resolve => setTimeout(resolve, 100));
+        }
+
         try {
-            channel.send(JSON.stringify(resultMessage));
+            channel.send(resultJson);
             console.log("✅ Sent BYTE result via WebRTC successfully!");
+            addToComputeHistory({
+                taskId: msg.task_id,
+                dataChunk: [],
+                result: [resultBytes.length],
+                mode: mapFunction,
+                communication: "BYTE WASM",
+            });
         } catch (e) {
             console.error("❌ Failed to send BYTE result:", e);
         }
