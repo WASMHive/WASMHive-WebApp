@@ -1,4 +1,7 @@
 // Worker Node - receives compute tasks and WASM modules from master via WebRTC
+// VERSION: 2.1 - Fixed UTF-8 encoding in chunks
+console.log("🔧 Worker.js version 2.1 loaded - fixed UTF-8 encoding bug");
+
 let ws = new WebSocket("ws://localhost:3000");
 let myId;
 let peerConnections = {}; // { peerId: RTCPeerConnection }
@@ -9,6 +12,88 @@ let wasmCache = {}; // { mapFunction: wasmModule }
 
 // Chunk reassembly buffer: { chunk_id: { chunks: Map<index, data>, total_chunks, received_chunks } }
 let chunkBuffers = {};
+
+// Helper function to safely send data with flow control and automatic chunking
+async function safeSend(channel, data, description = "data") {
+    const MAX_BUFFERED = 2 * 1024 * 1024; // 2MB buffer threshold (very conservative to avoid collision)
+    const MAX_MESSAGE_SIZE = 32 * 1024; // 32KB per message (very conservative for bidirectional traffic)
+    
+    // Check channel state
+    if (channel.readyState !== "open") {
+        console.error(`❌ Cannot send ${description}: channel state is ${channel.readyState}`);
+        throw new Error(`Data channel not open: ${channel.readyState}`);
+    }
+    
+    // If message is small enough, send directly
+    if (data.length <= MAX_MESSAGE_SIZE) {
+        // Wait for buffer to drain if needed
+        while (channel.bufferedAmount > MAX_BUFFERED) {
+            console.log(`   ⏳ Waiting for send queue to drain (${channel.bufferedAmount} bytes buffered)...`);
+            await new Promise(resolve => setTimeout(resolve, 50));
+        }
+        
+        // Send the data
+        try {
+            channel.send(data);
+            console.log(`   ✅ Sent ${description} (${data.length} bytes, ${channel.bufferedAmount} buffered)`);
+            return true;
+        } catch (e) {
+            console.error(`❌ Failed to send ${description}:`, e);
+            throw e;
+        }
+    }
+    
+    // Message is too large - need to chunk it
+    const totalChunks = Math.ceil(data.length / MAX_MESSAGE_SIZE);
+    const chunkId = `result_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    
+    console.log(`   📦 Chunking ${description} into ${totalChunks} chunks (${data.length} bytes total)`);
+    
+    for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+        const start = chunkIndex * MAX_MESSAGE_SIZE;
+        const end = Math.min(start + MAX_MESSAGE_SIZE, data.length);
+        const chunkData = data.substring(start, end);
+        
+        // Properly encode chunk as UTF-8 then base64
+        // btoa() alone fails with UTF-8 characters, so we use TextEncoder
+        const utf8Bytes = new TextEncoder().encode(chunkData);
+        const binaryString = Array.from(utf8Bytes, byte => String.fromCharCode(byte)).join('');
+        const chunkB64 = btoa(binaryString);
+        
+        const chunkMessage = JSON.stringify({
+            chunk_id: chunkId,
+            chunk_index: chunkIndex,
+            total_chunks: totalChunks,
+            data: chunkB64
+        });
+        
+        // Wait for buffer to drain before sending this chunk
+        while (channel.bufferedAmount > MAX_BUFFERED) {
+            console.log(`   ⏳ Waiting for send queue to drain (${channel.bufferedAmount} bytes buffered)...`);
+            await new Promise(resolve => setTimeout(resolve, 100));
+        }
+        
+        // Double-check channel is still open before sending
+        if (channel.readyState !== "open") {
+            console.error(`❌ Channel closed while sending chunk ${chunkIndex + 1}/${totalChunks}`);
+            throw new Error(`Data channel closed during chunk transmission`);
+        }
+        
+        try {
+            channel.send(chunkMessage);
+            console.log(`   📤 Sent chunk ${chunkIndex + 1}/${totalChunks} of ${description} (${chunkData.length} bytes, buffer: ${channel.bufferedAmount})`);
+        } catch (e) {
+            console.error(`❌ Failed to send chunk ${chunkIndex + 1} of ${description}:`, e);
+            throw e;
+        }
+        
+        // Longer delay between chunks to avoid bidirectional traffic collision
+        await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    
+    console.log(`   ✅ Completed sending ${description} in ${totalChunks} chunks`);
+    return true;
+}
 
 // WebSocket connection setup
 ws.onopen = () => {
@@ -177,15 +262,19 @@ function handleOffer(data) {
 
 function setupDataChannel(channel, peerId) {
     channel.onopen = () => {
-        console.log("Data channel open with", peerId);
+        console.log("✅ Data channel open with", peerId);
         connectedPeers[peerId] = true;
         updateStatus();
     };
 
     channel.onclose = () => {
-        console.log("Data channel closed with", peerId);
+        console.log("⚠️ Data channel closed with", peerId);
         delete connectedPeers[peerId];
         updateStatus();
+    };
+
+    channel.onerror = (error) => {
+        console.error("❌ Data channel error with", peerId, ":", error);
     };
 
     channel.onmessage = async (event) => {
@@ -390,14 +479,18 @@ async function rgbaToPngBase64(rgbaBytes, width, height) {
         let ctx;
         if (typeof OffscreenCanvas !== 'undefined') {
             canvas = new OffscreenCanvas(width, height);
-            ctx = canvas.getContext('2d');
+            ctx = canvas.getContext('2d', { willReadFrequently: false });
         } else {
             const c = document.createElement('canvas');
             c.width = width;
             c.height = height;
             canvas = c;
-            ctx = canvas.getContext('2d');
+            ctx = canvas.getContext('2d', { willReadFrequently: false });
         }
+
+        // CRITICAL: Disable image smoothing to prevent blurriness
+        ctx.imageSmoothingEnabled = false;
+        ctx.imageSmoothingQuality = 'high';
 
         const imageData = new ImageData(width, height);
         imageData.data.set(rgbaBytes);
@@ -572,9 +665,13 @@ async function handleComputeTask(msg, peerId) {
             workerId: myId
         };
 
-        if (dataChannels[peerId] && dataChannels[peerId].readyState === "open") {
-            dataChannels[peerId].send(JSON.stringify(resultMessage));
-            console.log("✅ Sent compute result:", resultMessage);
+        if (dataChannels[peerId]) {
+            try {
+                await safeSend(dataChannels[peerId], JSON.stringify(resultMessage), "compute result");
+                console.log("✅ Sent compute result:", resultMessage);
+            } catch (e) {
+                console.error("❌ Failed to send compute result:", e);
+            }
         }
 
     } catch (error) {
@@ -589,8 +686,12 @@ async function handleComputeTask(msg, peerId) {
             error: error.message
         };
 
-        if (dataChannels[peerId] && dataChannels[peerId].readyState === "open") {
-            dataChannels[peerId].send(JSON.stringify(errorMessage));
+        if (dataChannels[peerId]) {
+            try {
+                await safeSend(dataChannels[peerId], JSON.stringify(errorMessage), "compute error");
+            } catch (e) {
+                console.error("❌ Failed to send compute error:", e);
+            }
         }
     }
 }
@@ -680,7 +781,7 @@ async function handleRustWebRTCTask(msg, channel) {
         console.log("   🔍 Channel state:", channel.readyState);
 
         try {
-            channel.send(JSON.stringify(resultMessage));
+            await safeSend(channel, JSON.stringify(resultMessage), "WASM result");
             console.log("✅ Sent WASM result via WebRTC successfully!");
         } catch (e) {
             console.error("❌ Failed to send result:", e);
@@ -697,7 +798,11 @@ async function handleRustWebRTCTask(msg, channel) {
             worker_id: myId
         };
 
-        channel.send(JSON.stringify(errorMessage));
+        try {
+            await safeSend(channel, JSON.stringify(errorMessage), "WASM error");
+        } catch (e) {
+            console.error("❌ Failed to send error message:", e);
+        }
     }
 }
 
@@ -778,16 +883,10 @@ async function handleRustWebRTCTaskBytes(msg, channel) {
             meta: Object.assign({}, msg.meta || null, { format: 'png' }),
         };
 
-        // Wait for send queue to drain before sending large result
+        // Use safeSend for flow control
         const resultJson = JSON.stringify(resultMessage);
-        const maxBuffered = 16 * 1024 * 1024; // 16MB
-        while (channel.bufferedAmount > maxBuffered) {
-            console.log(`   ⏳ Waiting for send queue to drain (${channel.bufferedAmount} bytes buffered)...`);
-            await new Promise(resolve => setTimeout(resolve, 100));
-        }
-
         try {
-            channel.send(resultJson);
+            await safeSend(channel, resultJson, "BYTE result");
             console.log("✅ Sent BYTE result via WebRTC successfully!");
             addToComputeHistory({
                 taskId: msg.task_id,
@@ -809,6 +908,10 @@ async function handleRustWebRTCTaskBytes(msg, channel) {
             worker_id: myId,
             meta: msg.meta || null,
         };
-        channel.send(JSON.stringify(errorMessage));
+        try {
+            await safeSend(channel, JSON.stringify(errorMessage), "BYTE error");
+        } catch (e) {
+            console.error("❌ Failed to send error message:", e);
+        }
     }
 }
