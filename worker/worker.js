@@ -9,6 +9,14 @@ let wasmCache = {}; // { mapFunction: wasmModule }
 let latestPeers = []; // Cache latest peer list for redraws
 let latestAllocation = null; // Cache latest allocation payload
 
+// Fault tolerance tracking
+let workerHealth = "healthy"; // "healthy", "failed", "recovering", "connecting"
+let tasksCompleted = 0;
+let tasksFailed = 0;
+let faultToleranceEvents = []; // Store fault tolerance events
+let failedWorkers = new Set(); // Track failed workers in network
+let hasEverConnected = false; // Track if we've ever had a successful connection
+
 // SVG topology elements
 const networkSvg = document.getElementById("networkSvg");
 
@@ -20,12 +28,14 @@ ws.onopen = () => {
     console.log("Worker connected to WebSocket server");
     document.getElementById("wsStatus").innerText = "Connected to signaling server";
     document.getElementById("wsStatus").className = "status connected";
+    hasEverConnected = true;
     // Explicitly register as a worker for clarity on the signaling server
     try {
         ws.send(JSON.stringify({ type: "registerWorker" }));
     } catch (e) {
         console.error("Failed to register as worker:", e);
     }
+    updateHealthStatus();
 };
 
 ws.onmessage = (message) => {
@@ -76,6 +86,8 @@ ws.onclose = () => {
         el.innerText = "Disconnected";
         el.className = "status disconnected";
     }
+    addFaultToleranceEvent("failure", "WebSocket connection lost");
+    updateHealthStatus();
 };
 
 ws.onerror = (error) => {
@@ -85,20 +97,45 @@ ws.onerror = (error) => {
         el.innerText = "Connection Error";
         el.className = "status disconnected";
     }
+    addFaultToleranceEvent("failure", "WebSocket connection error");
+    updateHealthStatus();
 };
 
 function updatePeerList(peers) {
     const others = peers.filter((id) => id !== myId);
+    
+    // Track which peers are no longer in the list (they may have failed)
+    const currentPeerSet = new Set(peers);
+    const previousPeerSet = new Set(latestPeers || []);
+    
+    // Mark peers that disappeared as failed
+    previousPeerSet.forEach(peerId => {
+        if (!currentPeerSet.has(peerId) && peerId !== myId) {
+            failedWorkers.add(peerId);
+            addFaultToleranceEvent("failure", `Peer ${peerId} disconnected from network`);
+        }
+    });
+    
+    // Remove peers that came back from failed list
+    currentPeerSet.forEach(peerId => {
+        if (failedWorkers.has(peerId) && peerId !== myId) {
+            failedWorkers.delete(peerId);
+            addFaultToleranceEvent("recovery", `Peer ${peerId} reconnected`);
+        }
+    });
+    
     latestPeers = peers.slice();
 
     // Show all peers with current peer in bold
     if (peers.length > 0) {
         const peerDisplay = peers.map(id => {
+            let display = id;
             if (id === myId) {
-                return `<strong>${id}</strong>`;
-            } else {
-                return id;
+                display = `<strong>${id}</strong>`;
+            } else if (failedWorkers.has(id)) {
+                display = `<span style="color: #FF6B6B; text-decoration: line-through;">${id}</span>`;
             }
+            return display;
         }).join(", ");
         document.getElementById("peerList").innerHTML = peerDisplay;
     } else {
@@ -253,12 +290,15 @@ function setupDataChannel(channel, peerId) {
         console.log("Data channel open with", peerId);
         connectedPeers[peerId] = true;
         updateStatus();
+        updateHealthStatus();
     };
 
     channel.onclose = () => {
         console.log("Data channel closed with", peerId);
         delete connectedPeers[peerId];
+        addFaultToleranceEvent("failure", `Data channel closed with ${peerId}`);
         updateStatus();
+        updateHealthStatus();
     };
 
     channel.onmessage = async (event) => {
@@ -494,6 +534,23 @@ function drawNetwork(peers) {
 		label.setAttribute("text-anchor", "middle");
 		label.setAttribute("font-family", "'Segoe UI', Tahoma, Geneva, Verdana, sans-serif");
 		label.textContent = id;
+
+		// Color code based on health status
+		if (failedWorkers.has(id)) {
+			circle.setAttribute("fill", "#FF6B6B");
+			circle.setAttribute("stroke", "#FF4444");
+			circle.setAttribute("stroke-width", "3");
+		} else if (isSelf && workerHealth === "failed") {
+			circle.setAttribute("fill", "#FF6B6B");
+			circle.setAttribute("stroke", "#FF4444");
+		} else if (isSelf && (workerHealth === "recovering" || workerHealth === "connecting")) {
+			circle.setAttribute("fill", "#FFD93D");
+			circle.setAttribute("stroke", "#FFB800");
+		} else if (isSelf) {
+			// Healthy - keep default green
+			circle.setAttribute("fill", "#90EE90");
+			circle.setAttribute("stroke", "#32CD32");
+		}
 
 		group.appendChild(circle);
 		group.appendChild(label);
@@ -856,6 +913,10 @@ async function handleRustWebRTCTask(msg, channel) {
             mode: mapFunction,
             communication: "WASM " + mapFunction
         });
+        
+        // Update fault tolerance stats
+        tasksCompleted++;
+        updateHealthStatus();
 
         // Send result back via WebRTC data channel
         const resultMessage = {
@@ -878,6 +939,11 @@ async function handleRustWebRTCTask(msg, channel) {
     } catch (error) {
         console.error("❌ Error processing WASM task:", error);
         console.error("   Error stack:", error.stack);
+
+        // Update fault tolerance stats
+        tasksFailed++;
+        addFaultToleranceEvent("failure", `Task ${msg.task_id} failed: ${error.message}`);
+        updateHealthStatus();
 
         // Send error back in format that matches WorkerResult enum
         // Must match Floats variant: { task_id, result, worker_id }
@@ -992,6 +1058,10 @@ async function handleRustWebRTCTaskBytes(msg, channel) {
                 mode: mapFunction,
                 communication: "BYTE WASM",
             });
+            
+            // Update fault tolerance stats
+            tasksCompleted++;
+            updateHealthStatus();
         } catch (e) {
             console.error("❌ Failed to send BYTE result:", e);
         }
@@ -1007,4 +1077,164 @@ async function handleRustWebRTCTaskBytes(msg, channel) {
         };
         channel.send(JSON.stringify(errorMessage));
     }
+}
+
+// ===== Fault Tolerance Visualization Functions =====
+
+function addFaultToleranceEvent(type, message) {
+    const timestamp = new Date().toLocaleTimeString();
+    const event = {
+        type: type, // "failure", "reassignment", "recovery"
+        message: message,
+        timestamp: timestamp
+    };
+    
+    faultToleranceEvents.unshift(event);
+    
+    // Keep only last 20 events
+    if (faultToleranceEvents.length > 20) {
+        faultToleranceEvents = faultToleranceEvents.slice(0, 20);
+    }
+    
+    updateFaultToleranceEventsDisplay();
+}
+
+function updateFaultToleranceEventsDisplay() {
+    const container = document.getElementById("faultToleranceEvents");
+    if (!container) return;
+    
+    if (faultToleranceEvents.length === 0) {
+        container.innerHTML = '<div class="history-message">No fault tolerance events yet...</div>';
+        return;
+    }
+    
+    const eventsHTML = faultToleranceEvents.map(event => {
+        const icon = event.type === "failure" ? "❌" : event.type === "reassignment" ? "🔄" : "✅";
+        return `
+            <div class="fault-event ${event.type}">
+                <strong>${icon} ${event.timestamp}</strong><br>
+                ${event.message}
+            </div>
+        `;
+    }).join("");
+    
+    container.innerHTML = eventsHTML;
+    container.scrollTop = 0;
+}
+
+function updateHealthStatus() {
+    const healthIndicator = document.getElementById("healthIndicator");
+    const healthStatus = document.getElementById("healthStatus");
+    const connectionState = document.getElementById("connectionState");
+    const tasksCompletedEl = document.getElementById("tasksCompleted");
+    const tasksFailedEl = document.getElementById("tasksFailed");
+    
+    if (!healthIndicator || !healthStatus) return;
+    
+    // Determine health based on connections
+    const hasActiveConnections = Object.keys(connectedPeers).length > 0;
+    const wsConnected = ws.readyState === WebSocket.OPEN;
+    const wsConnecting = ws.readyState === WebSocket.CONNECTING;
+    
+    // If we've never connected, we're still in initial state (connecting/healthy)
+    if (!hasEverConnected) {
+        if (wsConnecting) {
+            workerHealth = "connecting";
+            healthIndicator.className = "health-indicator connecting";
+            healthStatus.textContent = "Connecting";
+            connectionState.textContent = "Connecting...";
+            connectionState.style.color = "#87CEEB";
+        } else if (wsConnected) {
+            // Just connected for the first time
+            hasEverConnected = true;
+            workerHealth = "healthy";
+            healthIndicator.className = "health-indicator healthy";
+            healthStatus.textContent = "Healthy";
+            connectionState.textContent = "Connected";
+            connectionState.style.color = "#90EE90";
+        } else {
+            // Initial state - not connected yet but haven't failed
+            workerHealth = "healthy";
+            healthIndicator.className = "health-indicator healthy";
+            healthStatus.textContent = "Initializing";
+            connectionState.textContent = "Initializing...";
+            connectionState.style.color = "#87CEEB";
+        }
+    } else {
+        // We've had a connection before, so we can detect failures
+        if (!wsConnected && !hasActiveConnections) {
+            // Lost connection after having one - this is a failure
+            if (workerHealth !== "recovering") {
+                workerHealth = "failed";
+                healthIndicator.className = "health-indicator failed";
+                healthStatus.textContent = "Failed";
+                connectionState.textContent = "Disconnected";
+                connectionState.style.color = "#FF6B6B";
+            }
+        } else if (workerHealth === "recovering") {
+            healthIndicator.className = "health-indicator recovering";
+            healthStatus.textContent = "Recovering";
+            connectionState.textContent = "Reconnecting";
+            connectionState.style.color = "#FFD93D";
+        } else {
+            workerHealth = "healthy";
+            healthIndicator.className = "health-indicator healthy";
+            healthStatus.textContent = "Healthy";
+            connectionState.textContent = "Connected";
+            connectionState.style.color = "#90EE90";
+        }
+    }
+    
+    if (tasksCompletedEl) tasksCompletedEl.textContent = tasksCompleted;
+    if (tasksFailedEl) tasksFailedEl.textContent = tasksFailed;
+    
+    // Redraw network to show health status
+    if (latestPeers && latestPeers.length > 0) {
+        drawNetwork(latestPeers);
+    }
+}
+
+function simulateWorkerFailure() {
+    if (workerHealth === "failed") {
+        // Recovery simulation
+        workerHealth = "recovering";
+        addFaultToleranceEvent("recovery", "Worker recovery initiated...");
+        
+        setTimeout(() => {
+            workerHealth = "healthy";
+            addFaultToleranceEvent("recovery", "Worker recovered successfully!");
+            updateHealthStatus();
+        }, 2000);
+    } else {
+        // Failure simulation
+        workerHealth = "failed";
+        addFaultToleranceEvent("failure", "Worker failure simulated for demonstration");
+        
+        // Close all data channels to simulate failure
+        Object.keys(dataChannels).forEach(peerId => {
+            const channel = dataChannels[peerId];
+            if (channel && channel.readyState === "open") {
+                channel.close();
+            }
+        });
+        
+        // Close WebSocket connection
+        if (ws.readyState === WebSocket.OPEN) {
+            ws.close();
+        }
+        
+        updateHealthStatus();
+        
+        // Show reassignment message after a delay
+        setTimeout(() => {
+            addFaultToleranceEvent("reassignment", "Tasks being reassigned to other workers...");
+        }, 1000);
+    }
+}
+
+// Initialize health status on load
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', updateHealthStatus);
+} else {
+    updateHealthStatus();
 }

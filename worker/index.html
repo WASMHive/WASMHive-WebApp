@@ -118,6 +118,107 @@
             margin: 20px 0;
             border-left: 4px solid #87CEEB;
         }
+
+        .fault-tolerance-status {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 10px;
+            padding: 20px;
+            margin: 20px 0;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .health-indicator {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            margin-right: 8px;
+            animation: pulse 2s infinite;
+        }
+
+        .health-indicator.healthy {
+            background: #90EE90;
+            box-shadow: 0 0 10px rgba(144, 238, 144, 0.5);
+        }
+
+        .health-indicator.failed {
+            background: #FF6B6B;
+            box-shadow: 0 0 10px rgba(255, 107, 107, 0.5);
+            animation: blink 1s infinite;
+        }
+
+        .health-indicator.recovering {
+            background: #FFD93D;
+            box-shadow: 0 0 10px rgba(255, 217, 61, 0.5);
+        }
+
+        .health-indicator.connecting {
+            background: #87CEEB;
+            box-shadow: 0 0 10px rgba(135, 206, 235, 0.5);
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.6; }
+        }
+
+        @keyframes blink {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.3; }
+        }
+
+        .fault-event {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 6px;
+            padding: 10px;
+            margin: 8px 0;
+            border-left: 3px solid;
+            font-size: 13px;
+            animation: slideIn 0.3s ease;
+        }
+
+        .fault-event.failure {
+            border-left-color: #FF6B6B;
+            background: rgba(255, 107, 107, 0.1);
+        }
+
+        .fault-event.reassignment {
+            border-left-color: #FFD93D;
+            background: rgba(255, 217, 61, 0.1);
+        }
+
+        .fault-event.recovery {
+            border-left-color: #90EE90;
+            background: rgba(144, 238, 144, 0.1);
+        }
+
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateX(-10px);
+            }
+            to {
+                opacity: 1;
+                transform: translateX(0);
+            }
+        }
+
+        .simulate-failure-btn {
+            background: rgba(255, 107, 107, 0.3);
+            border: 1px solid rgba(255, 107, 107, 0.5);
+            color: white;
+            padding: 10px 20px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: bold;
+            margin-top: 10px;
+            transition: all 0.3s ease;
+        }
+
+        .simulate-failure-btn:hover {
+            background: rgba(255, 107, 107, 0.5);
+            transform: scale(1.05);
+        }
     </style>
 </head>
 <body>
@@ -148,6 +249,28 @@
             <h3>Resource Allocation</h3>
             <div id="allocationSummary" class="history-display">
                 <div class="history-message">Waiting for allocation data...</div>
+            </div>
+        </div>
+
+        <div class="info-section fault-tolerance-status">
+            <h3>🛡️ Fault Tolerance Status</h3>
+            <p>
+                <strong>Worker Health:</strong> 
+                <span class="health-indicator healthy" id="healthIndicator"></span>
+                <span id="healthStatus">Healthy</span>
+            </p>
+            <p><strong>Connection State:</strong> <span id="connectionState">Connected</span></p>
+            <p><strong>Tasks Completed:</strong> <span id="tasksCompleted">0</span></p>
+            <p><strong>Tasks Failed:</strong> <span id="tasksFailed">0</span></p>
+            <button class="simulate-failure-btn" id="simulateFailureBtn" onclick="simulateWorkerFailure()">
+                🧪 Simulate Worker Failure (Demo)
+            </button>
+        </div>
+
+        <div class="info-section">
+            <h3>⚡ Fault Tolerance Events</h3>
+            <div id="faultToleranceEvents" class="history-display" style="max-height: 200px;">
+                <div class="history-message">No fault tolerance events yet...</div>
             </div>
         </div>
     </div>
