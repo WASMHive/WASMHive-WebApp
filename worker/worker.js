@@ -6,6 +6,10 @@ let dataChannels = {}; // { peerId: RTCDataChannel }
 let connectedPeers = {}; // { peerId: true } when data channel is open
 let computeHistory = []; // Store compute task history
 let wasmCache = {}; // { mapFunction: wasmModule }
+let latestPeers = []; // Cache latest peer list for redraws
+
+// SVG topology elements
+const networkSvg = document.getElementById("networkSvg");
 
 // Chunk reassembly buffer: { chunk_id: { chunks: Map<index, data>, total_chunks, received_chunks } }
 let chunkBuffers = {};
@@ -57,6 +61,7 @@ ws.onmessage = (message) => {
 
 function updatePeerList(peers) {
     const others = peers.filter((id) => id !== myId);
+    latestPeers = peers.slice();
 
     // Show all peers with current peer in bold
     if (peers.length > 0) {
@@ -84,6 +89,9 @@ function updatePeerList(peers) {
             createConnection(peerId);
         }
     });
+
+	// Redraw topology
+	drawNetwork(latestPeers);
 }
 
 function createConnection(peerId) {
@@ -299,6 +307,9 @@ function setupDataChannel(channel, peerId) {
 function updateStatus() {
     // This function is called when peer connections change
     // The total peer count is handled in updatePeerList
+    if (latestPeers && latestPeers.length > 0) {
+        drawNetwork(latestPeers);
+    }
 }
 
 // Add task to compute history and update display
@@ -347,6 +358,82 @@ function updateComputeHistoryDisplay() {
 
     // Auto-scroll to top to show latest task
     historyContainer.scrollTop = 0;
+}
+
+// ===== Network Topology Rendering =====
+function drawNetwork(peers) {
+	if (!networkSvg) return;
+
+	// Clear SVG
+	while (networkSvg.firstChild) networkSvg.removeChild(networkSvg.firstChild);
+
+	const rect = networkSvg.getBoundingClientRect();
+	const width = rect.width || 760;
+	const height = rect.height || 320;
+	const centerX = width / 2;
+	const centerY = height / 2;
+	const radius = Math.max(80, Math.min(width, height) / 2 - 40);
+
+	// Calculate positions in a circle layout
+	const positions = {}; // { id: {x,y} }
+	const n = peers.length;
+	if (n === 0) return;
+
+	peers.forEach((id, index) => {
+		const angle = (index / n) * Math.PI * 2 - Math.PI / 2;
+		positions[id] = {
+			x: centerX + radius * Math.cos(angle),
+			y: centerY + radius * Math.sin(angle)
+		};
+	});
+
+	// Draw connections: interconnect all nodes with lines (undirected)
+	for (let i = 0; i < peers.length; i++) {
+		for (let j = i + 1; j < peers.length; j++) {
+			const a = positions[peers[i]];
+			const b = positions[peers[j]];
+			if (!a || !b) continue;
+			const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+			line.setAttribute("x1", a.x);
+			line.setAttribute("y1", a.y);
+			line.setAttribute("x2", b.x);
+			line.setAttribute("y2", b.y);
+			line.setAttribute("stroke", "#87CEEB");
+			line.setAttribute("stroke-width", "1.5");
+			line.setAttribute("stroke-opacity", "0.35");
+			networkSvg.appendChild(line);
+		}
+	}
+
+	// Draw nodes
+	peers.forEach((id) => {
+		const pos = positions[id];
+		const isSelf = id === myId;
+		const group = document.createElementNS("http://www.w3.org/2000/svg", "g");
+
+		// Node circle
+		const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+		circle.setAttribute("cx", pos.x);
+		circle.setAttribute("cy", pos.y);
+		circle.setAttribute("r", isSelf ? "16" : "12");
+		circle.setAttribute("fill", isSelf ? "#90EE90" : "#ffffff22");
+		circle.setAttribute("stroke", isSelf ? "#32CD32" : "#FFFFFF55");
+		circle.setAttribute("stroke-width", isSelf ? "3" : "2");
+
+		// Label
+		const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
+		label.setAttribute("x", pos.x);
+		label.setAttribute("y", pos.y + (isSelf ? 30 : 26));
+		label.setAttribute("fill", "#ffffffcc");
+		label.setAttribute("font-size", "12");
+		label.setAttribute("text-anchor", "middle");
+		label.setAttribute("font-family", "'Segoe UI', Tahoma, Geneva, Verdana, sans-serif");
+		label.textContent = id;
+
+		group.appendChild(circle);
+		group.appendChild(label);
+		networkSvg.appendChild(group);
+	});
 }
 
 // Helper: Convert Base64 to ArrayBuffer
