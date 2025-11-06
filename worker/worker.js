@@ -826,17 +826,26 @@ async function handleRustWebRTCTask(msg, channel) {
     console.log("🦀 Worker received Rust WebRTC task:", msg);
 
     try {
-        console.log("🔧 Loading WASM module and executing map function...");
-
-        // Decode base64 WASM module
-        const wasmBytes = base64ToArrayBuffer(msg.wasm_module);
-
-        // Load WASM module with JS glue
-        const wasmModule = await loadSeparateWasmModule(wasmBytes, msg.js_glue);
-
         // Determine which WASM function to call
         const mapFunction = msg.map_function; // "cpu_map", "gpu_map", or "cpu1_map"
         console.log(`📊 Executing WASM function: ${mapFunction}`);
+
+        // Load or reuse WASM module (optimization: cache WASM to avoid reloading)
+        let wasmModule = wasmCache[mapFunction];
+        if (!wasmModule && msg.wasm_module && msg.wasm_module.length > 0) {
+            console.log("🔧 Loading WASM module and executing map function...");
+            // Decode base64 WASM module
+            const wasmBytes = base64ToArrayBuffer(msg.wasm_module);
+            // Load WASM module with JS glue
+            wasmModule = await loadSeparateWasmModule(wasmBytes, msg.js_glue);
+            // Cache the loaded module
+            wasmCache[mapFunction] = wasmModule;
+            console.log("✅ WASM module loaded and cached");
+        } else if (wasmModule) {
+            console.log("♻️  Reusing cached WASM module");
+        } else {
+            throw new Error(`No WASM module provided and no cached module for ${mapFunction}`);
+        }
 
         let result;
 
