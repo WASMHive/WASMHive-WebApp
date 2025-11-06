@@ -69,6 +69,51 @@ function broadcastPeerList() {
   for (const clientId in clients) {
     clients[clientId].ws.send(message);
   }
+
+  // Also broadcast fair-share allocation of workers to masters
+  const allocationPayload = computeFairShareAllocation();
+  const allocationMessage = JSON.stringify({ type: "allocation", ...allocationPayload });
+  for (const clientId in clients) {
+    clients[clientId].ws.send(allocationMessage);
+  }
 }
 
 console.log("WebSocket server running on ws://localhost:3000");
+
+// Fair-share scheduling: distribute workers evenly across masters in round-robin order
+function computeFairShareAllocation() {
+  const workerList = Object.keys(workers);
+  const masterList = Object.keys(masters);
+
+  // Deterministic order for stability
+  masterList.sort();
+  workerList.sort();
+
+  /** @type {Record<string, string[]>} */
+  const allocation = {};
+  masterList.forEach((m) => (allocation[m] = []));
+
+  if (masterList.length === 0) {
+    return {
+      allocation,
+      counts: {},
+      totalWorkers: workerList.length,
+      totalMasters: 0,
+    };
+  }
+
+  for (let i = 0; i < workerList.length; i++) {
+    const masterId = masterList[i % masterList.length];
+    allocation[masterId].push(workerList[i]);
+  }
+
+  const counts = {};
+  for (const m of masterList) counts[m] = allocation[m].length;
+
+  return {
+    allocation,
+    counts,
+    totalWorkers: workerList.length,
+    totalMasters: masterList.length,
+  };
+}

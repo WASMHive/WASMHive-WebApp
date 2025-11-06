@@ -7,6 +7,7 @@ let connectedPeers = {}; // { peerId: true } when data channel is open
 let computeHistory = []; // Store compute task history
 let wasmCache = {}; // { mapFunction: wasmModule }
 let latestPeers = []; // Cache latest peer list for redraws
+let latestAllocation = null; // Cache latest allocation payload
 
 // SVG topology elements
 const networkSvg = document.getElementById("networkSvg");
@@ -19,6 +20,12 @@ ws.onopen = () => {
     console.log("Worker connected to WebSocket server");
     document.getElementById("wsStatus").innerText = "Connected to signaling server";
     document.getElementById("wsStatus").className = "status connected";
+    // Explicitly register as a worker for clarity on the signaling server
+    try {
+        ws.send(JSON.stringify({ type: "registerWorker" }));
+    } catch (e) {
+        console.error("Failed to register as worker:", e);
+    }
 };
 
 ws.onmessage = (message) => {
@@ -32,6 +39,9 @@ ws.onmessage = (message) => {
     }
     if (data.type === "peerList") {
         if (myId) updatePeerList(data.peers);
+    }
+    if (data.type === "allocation") {
+        renderAllocation(data);
     }
     if (data.type === "offer") {
         handleOffer(data);
@@ -56,6 +66,24 @@ ws.onmessage = (message) => {
     if (data.type === "directTask") {
         // Handle direct task from master via WebSocket
         handleDirectTask(data);
+    }
+};
+
+ws.onclose = () => {
+    console.log("Disconnected from WebSocket signaling server");
+    const el = document.getElementById("wsStatus");
+    if (el) {
+        el.innerText = "Disconnected";
+        el.className = "status disconnected";
+    }
+};
+
+ws.onerror = (error) => {
+    console.error("WebSocket error:", error);
+    const el = document.getElementById("wsStatus");
+    if (el) {
+        el.innerText = "Connection Error";
+        el.className = "status disconnected";
     }
 };
 
@@ -92,6 +120,43 @@ function updatePeerList(peers) {
 
 	// Redraw topology
 	drawNetwork(latestPeers);
+}
+
+// Render resource allocation summary
+function renderAllocation(payload) {
+    latestAllocation = payload;
+    const container = document.getElementById("allocationSummary");
+    if (!container) return;
+
+    const { allocation = {}, counts = {}, totalWorkers = 0 } = payload || {};
+    const totalClients = (payload && (payload.totalClients ?? payload.totalMasters)) || 0;
+
+    if (!totalClients) {
+        container.innerHTML = '<div class="history-message">No masters/clients registered. All workers idle or awaiting tasks.</div>';
+        return;
+    }
+
+    const rows = Object.keys(allocation).sort().map((clientId) => {
+        const assigned = allocation[clientId] || [];
+        const count = counts[clientId] || 0;
+        const percentage = totalWorkers ? Math.round((count / totalWorkers) * 100) : 0;
+        return `
+            <div class="history-item">
+                <div class="history-timestamp">Client: ${clientId}</div>
+                <strong>Workers Assigned:</strong> ${count} / ${totalWorkers} (${percentage}%)<br>
+                <strong>Worker IDs:</strong> ${assigned.length ? assigned.join(', ') : '—'}
+            </div>
+        `;
+    }).join("");
+
+    const header = `
+        <div class="history-item">
+            <div class="history-timestamp">Allocation Policy: Fair Share (Round-Robin)</div>
+            <strong>Total Clients:</strong> ${totalClients} &nbsp; | &nbsp; <strong>Total Workers:</strong> ${totalWorkers}
+        </div>
+    `;
+
+    container.innerHTML = header + rows;
 }
 
 function createConnection(peerId) {
@@ -727,7 +792,31 @@ async function handleRustWebRTCTask(msg, channel) {
             }
         } else if (mapFunction === "gpu_map") {
             // Execute gpu_map with batch async WebGPU processing
-            result = await wasmModule.gpu_map(msg.data_chunk);
+            // Check if WebGPU is available first
+            if (typeof navigator !== 'undefined' && navigator.gpu) {
+                try {
+                    result = await wasmModule.gpu_map(msg.data_chunk);
+                } catch (gpuError) {
+                    console.error("❌ GPU execution failed, falling back to CPU:", gpuError);
+                    console.error("   Error details:", gpuError.message, gpuError.stack);
+                    // Fallback to CPU if GPU fails
+                    result = [];
+                    for (const num of msg.data_chunk) {
+                        const mapped = wasmModule.cpu_map(num);
+                        result.push(mapped);
+                    }
+                    console.log("✅ Fallback to CPU completed");
+                }
+            } else {
+                console.warn("⚠️ WebGPU not available, using CPU fallback");
+                // WebGPU not available, use CPU
+                result = [];
+                for (const num of msg.data_chunk) {
+                    const mapped = wasmModule.cpu_map(num);
+                    result.push(mapped);
+                }
+                console.log("✅ CPU execution completed (WebGPU unavailable)");
+            }
         } else if (mapFunction === "cpu1_map") {
             // Execute cpu1_map on each element (x³)
             result = [];
@@ -739,12 +828,25 @@ async function handleRustWebRTCTask(msg, channel) {
             throw new Error(`Unknown map function: ${mapFunction}`);
         }
 
-        console.log(`✅ WASM execution completed. Input: [${msg.data_chunk.join(',')}] -> Output: [${result.join(',')}]`);
+        // Validate result before proceeding
+        if (result === undefined || result === null) {
+            throw new Error("WASM function returned undefined or null result");
+        }
+
+        console.log(`✅ WASM execution completed. Input: [${msg.data_chunk.join(',')}] -> Output: [${result?.join ? result.join(',') : 'invalid'}]`);
         console.log(`   📊 Result type: ${typeof result}, Array: ${Array.isArray(result)}, Length: ${result?.length}`);
 
         // Convert Float32Array or other typed arrays to regular Array for JSON serialization
-        const resultArray = Array.isArray(result) ? result : Array.from(result);
-        console.log(`   🔄 Converted to Array: ${Array.isArray(resultArray)}`);
+        let resultArray;
+        if (Array.isArray(result)) {
+            resultArray = result;
+        } else if (result && typeof result.length === 'number') {
+            // Typed array (Float32Array, etc.)
+            resultArray = Array.from(result);
+        } else {
+            throw new Error(`Invalid result type from WASM function: ${typeof result}`);
+        }
+        console.log(`   🔄 Converted to Array: ${Array.isArray(resultArray)}, Length: ${resultArray.length}`);
 
         // Add to compute history
         addToComputeHistory({
@@ -775,16 +877,23 @@ async function handleRustWebRTCTask(msg, channel) {
 
     } catch (error) {
         console.error("❌ Error processing WASM task:", error);
+        console.error("   Error stack:", error.stack);
 
-        // Send error back
+        // Send error back in format that matches WorkerResult enum
+        // Must match Floats variant: { task_id, result, worker_id }
+        // Send empty result array to indicate failure
         const errorMessage = {
             task_id: msg.task_id,
-            result: [],
-            error: error.message,
+            result: [], // Empty result indicates failure
             worker_id: myId
         };
 
-        channel.send(JSON.stringify(errorMessage));
+        try {
+            channel.send(JSON.stringify(errorMessage));
+            console.log("✅ Sent error result back to master");
+        } catch (sendError) {
+            console.error("❌ Failed to send error result:", sendError);
+        }
     }
 }
 
