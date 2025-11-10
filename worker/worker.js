@@ -1034,19 +1034,29 @@ async function handleRustWebRTCTaskBytes(msg, channel) {
             }
         }
 
-        // Encode result as PNG base64 to reduce payload size
+        // Encode result as PNG base64 to reduce payload size (only for image data)
+        // For non-image data (like text), encode directly as base64
         const w = (msg.meta && msg.meta.width) || 0;
         const h = (msg.meta && msg.meta.height) || 0;
-        console.log(`   🖼️  Encoding PNG: ${w}x${h}, bytes: ${resultBytes.length}`);
-        const resultB64 = await rgbaToPngBase64(resultBytes, w, h);
-        console.log(`   📦 PNG base64 length: ${resultB64.length}`);
+        let resultB64;
+        if (w > 0 && h > 0) {
+            // Image data: encode as PNG
+            console.log(`   🖼️  Encoding PNG: ${w}x${h}, bytes: ${resultBytes.length}`);
+            resultB64 = await rgbaToPngBase64(resultBytes, w, h);
+            console.log(`   📦 PNG base64 length: ${resultB64.length}`);
+        } else {
+            // Non-image data: encode directly as base64
+            console.log(`   📦 Encoding raw bytes as base64: ${resultBytes.length} bytes`);
+            resultB64 = uint8ToBase64(resultBytes);
+            console.log(`   📦 Base64 length: ${resultB64.length}`);
+        }
 
         // Send result back with meta echoed
         const resultMessage = {
             task_id: msg.task_id,
             result_b64: resultB64,
             worker_id: myId,
-            meta: Object.assign({}, msg.meta || null, { format: 'png' }),
+            meta: Object.assign({}, msg.meta || null, { format: (w > 0 && h > 0) ? 'png' : 'raw' }),
         };
 
         // Wait for send queue to drain before sending large result
