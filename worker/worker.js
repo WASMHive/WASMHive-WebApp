@@ -103,11 +103,11 @@ ws.onerror = (error) => {
 
 function updatePeerList(peers) {
     const others = peers.filter((id) => id !== myId);
-    
+
     // Track which peers are no longer in the list (they may have failed)
     const currentPeerSet = new Set(peers);
     const previousPeerSet = new Set(latestPeers || []);
-    
+
     // Mark peers that disappeared as failed
     previousPeerSet.forEach(peerId => {
         if (!currentPeerSet.has(peerId) && peerId !== myId) {
@@ -115,7 +115,7 @@ function updatePeerList(peers) {
             addFaultToleranceEvent("failure", `Peer ${peerId} disconnected from network`);
         }
     });
-    
+
     // Remove peers that came back from failed list
     currentPeerSet.forEach(peerId => {
         if (failedWorkers.has(peerId) && peerId !== myId) {
@@ -123,7 +123,7 @@ function updatePeerList(peers) {
             addFaultToleranceEvent("recovery", `Peer ${peerId} reconnected`);
         }
     });
-    
+
     latestPeers = peers.slice();
 
     // Show all peers with current peer in bold
@@ -155,8 +155,8 @@ function updatePeerList(peers) {
         }
     });
 
-	// Redraw topology
-	drawNetwork(latestPeers);
+    // Redraw topology
+    drawNetwork(latestPeers);
 }
 
 // Render resource allocation summary
@@ -467,95 +467,95 @@ function updateComputeHistoryDisplay() {
 
 // ===== Network Topology Rendering =====
 function drawNetwork(peers) {
-	if (!networkSvg) return;
+    if (!networkSvg) return;
 
-	// Clear SVG
-	while (networkSvg.firstChild) networkSvg.removeChild(networkSvg.firstChild);
+    // Clear SVG
+    while (networkSvg.firstChild) networkSvg.removeChild(networkSvg.firstChild);
 
-	const rect = networkSvg.getBoundingClientRect();
-	const width = rect.width || 760;
-	const height = rect.height || 320;
-	const centerX = width / 2;
-	const centerY = height / 2;
-	const radius = Math.max(80, Math.min(width, height) / 2 - 40);
+    const rect = networkSvg.getBoundingClientRect();
+    const width = rect.width || 760;
+    const height = rect.height || 320;
+    const centerX = width / 2;
+    const centerY = height / 2;
+    const radius = Math.max(80, Math.min(width, height) / 2 - 40);
 
-	// Calculate positions in a circle layout
-	const positions = {}; // { id: {x,y} }
-	const n = peers.length;
-	if (n === 0) return;
+    // Calculate positions in a circle layout
+    const positions = {}; // { id: {x,y} }
+    const n = peers.length;
+    if (n === 0) return;
 
-	peers.forEach((id, index) => {
-		const angle = (index / n) * Math.PI * 2 - Math.PI / 2;
-		positions[id] = {
-			x: centerX + radius * Math.cos(angle),
-			y: centerY + radius * Math.sin(angle)
-		};
-	});
+    peers.forEach((id, index) => {
+        const angle = (index / n) * Math.PI * 2 - Math.PI / 2;
+        positions[id] = {
+            x: centerX + radius * Math.cos(angle),
+            y: centerY + radius * Math.sin(angle)
+        };
+    });
 
-	// Draw connections: interconnect all nodes with lines (undirected)
-	for (let i = 0; i < peers.length; i++) {
-		for (let j = i + 1; j < peers.length; j++) {
-			const a = positions[peers[i]];
-			const b = positions[peers[j]];
-			if (!a || !b) continue;
-			const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
-			line.setAttribute("x1", a.x);
-			line.setAttribute("y1", a.y);
-			line.setAttribute("x2", b.x);
-			line.setAttribute("y2", b.y);
-			line.setAttribute("stroke", "#87CEEB");
-			line.setAttribute("stroke-width", "1.5");
-			line.setAttribute("stroke-opacity", "0.35");
-			networkSvg.appendChild(line);
-		}
-	}
+    // Draw connections: interconnect all nodes with lines (undirected)
+    for (let i = 0; i < peers.length; i++) {
+        for (let j = i + 1; j < peers.length; j++) {
+            const a = positions[peers[i]];
+            const b = positions[peers[j]];
+            if (!a || !b) continue;
+            const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+            line.setAttribute("x1", a.x);
+            line.setAttribute("y1", a.y);
+            line.setAttribute("x2", b.x);
+            line.setAttribute("y2", b.y);
+            line.setAttribute("stroke", "#87CEEB");
+            line.setAttribute("stroke-width", "1.5");
+            line.setAttribute("stroke-opacity", "0.35");
+            networkSvg.appendChild(line);
+        }
+    }
 
-	// Draw nodes
-	peers.forEach((id) => {
-		const pos = positions[id];
-		const isSelf = id === myId;
-		const group = document.createElementNS("http://www.w3.org/2000/svg", "g");
+    // Draw nodes
+    peers.forEach((id) => {
+        const pos = positions[id];
+        const isSelf = id === myId;
+        const group = document.createElementNS("http://www.w3.org/2000/svg", "g");
 
-		// Node circle
-		const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
-		circle.setAttribute("cx", pos.x);
-		circle.setAttribute("cy", pos.y);
-		circle.setAttribute("r", isSelf ? "16" : "12");
-		circle.setAttribute("fill", isSelf ? "#90EE90" : "#ffffff22");
-		circle.setAttribute("stroke", isSelf ? "#32CD32" : "#FFFFFF55");
-		circle.setAttribute("stroke-width", isSelf ? "3" : "2");
+        // Node circle
+        const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+        circle.setAttribute("cx", pos.x);
+        circle.setAttribute("cy", pos.y);
+        circle.setAttribute("r", isSelf ? "16" : "12");
+        circle.setAttribute("fill", isSelf ? "#90EE90" : "#ffffff22");
+        circle.setAttribute("stroke", isSelf ? "#32CD32" : "#FFFFFF55");
+        circle.setAttribute("stroke-width", isSelf ? "3" : "2");
 
-		// Label
-		const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
-		label.setAttribute("x", pos.x);
-		label.setAttribute("y", pos.y + (isSelf ? 30 : 26));
-		label.setAttribute("fill", "#ffffffcc");
-		label.setAttribute("font-size", "12");
-		label.setAttribute("text-anchor", "middle");
-		label.setAttribute("font-family", "'Segoe UI', Tahoma, Geneva, Verdana, sans-serif");
-		label.textContent = id;
+        // Label
+        const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
+        label.setAttribute("x", pos.x);
+        label.setAttribute("y", pos.y + (isSelf ? 30 : 26));
+        label.setAttribute("fill", "#ffffffcc");
+        label.setAttribute("font-size", "12");
+        label.setAttribute("text-anchor", "middle");
+        label.setAttribute("font-family", "'Segoe UI', Tahoma, Geneva, Verdana, sans-serif");
+        label.textContent = id;
 
-		// Color code based on health status
-		if (failedWorkers.has(id)) {
-			circle.setAttribute("fill", "#FF6B6B");
-			circle.setAttribute("stroke", "#FF4444");
-			circle.setAttribute("stroke-width", "3");
-		} else if (isSelf && workerHealth === "failed") {
-			circle.setAttribute("fill", "#FF6B6B");
-			circle.setAttribute("stroke", "#FF4444");
-		} else if (isSelf && (workerHealth === "recovering" || workerHealth === "connecting")) {
-			circle.setAttribute("fill", "#FFD93D");
-			circle.setAttribute("stroke", "#FFB800");
-		} else if (isSelf) {
-			// Healthy - keep default green
-			circle.setAttribute("fill", "#90EE90");
-			circle.setAttribute("stroke", "#32CD32");
-		}
+        // Color code based on health status
+        if (failedWorkers.has(id)) {
+            circle.setAttribute("fill", "#FF6B6B");
+            circle.setAttribute("stroke", "#FF4444");
+            circle.setAttribute("stroke-width", "3");
+        } else if (isSelf && workerHealth === "failed") {
+            circle.setAttribute("fill", "#FF6B6B");
+            circle.setAttribute("stroke", "#FF4444");
+        } else if (isSelf && (workerHealth === "recovering" || workerHealth === "connecting")) {
+            circle.setAttribute("fill", "#FFD93D");
+            circle.setAttribute("stroke", "#FFB800");
+        } else if (isSelf) {
+            // Healthy - keep default green
+            circle.setAttribute("fill", "#90EE90");
+            circle.setAttribute("stroke", "#32CD32");
+        }
 
-		group.appendChild(circle);
-		group.appendChild(label);
-		networkSvg.appendChild(group);
-	});
+        group.appendChild(circle);
+        group.appendChild(label);
+        networkSvg.appendChild(group);
+    });
 }
 
 // Helper: Convert Base64 to ArrayBuffer
@@ -922,7 +922,7 @@ async function handleRustWebRTCTask(msg, channel) {
             mode: mapFunction,
             communication: "WASM " + mapFunction
         });
-        
+
         // Update fault tolerance stats
         tasksCompleted++;
         updateHealthStatus();
@@ -1006,12 +1006,12 @@ async function handleRustWebRTCTaskBytes(msg, channel) {
             resultBytes = chunkBytes.slice();
             for (let i = 0; i + 3 < resultBytes.length; i += 4) {
                 const r = resultBytes[i];
-                const g = resultBytes[i+1];
-                const b = resultBytes[i+2];
-                const gray = (0.299*r + 0.587*g + 0.114*b) | 0;
+                const g = resultBytes[i + 1];
+                const b = resultBytes[i + 2];
+                const gray = (0.299 * r + 0.587 * g + 0.114 * b) | 0;
                 resultBytes[i] = gray;
-                resultBytes[i+1] = gray;
-                resultBytes[i+2] = gray;
+                resultBytes[i + 1] = gray;
+                resultBytes[i + 2] = gray;
             }
         } else {
             // Try calling with (bytes, meta); extra args are ignored if not needed
@@ -1077,7 +1077,7 @@ async function handleRustWebRTCTaskBytes(msg, channel) {
                 mode: mapFunction,
                 communication: "BYTE WASM",
             });
-            
+
             // Update fault tolerance stats
             tasksCompleted++;
             updateHealthStatus();
@@ -1107,26 +1107,26 @@ function addFaultToleranceEvent(type, message) {
         message: message,
         timestamp: timestamp
     };
-    
+
     faultToleranceEvents.unshift(event);
-    
+
     // Keep only last 20 events
     if (faultToleranceEvents.length > 20) {
         faultToleranceEvents = faultToleranceEvents.slice(0, 20);
     }
-    
+
     updateFaultToleranceEventsDisplay();
 }
 
 function updateFaultToleranceEventsDisplay() {
     const container = document.getElementById("faultToleranceEvents");
     if (!container) return;
-    
+
     if (faultToleranceEvents.length === 0) {
         container.innerHTML = '<div class="history-message">No fault tolerance events yet...</div>';
         return;
     }
-    
+
     const eventsHTML = faultToleranceEvents.map(event => {
         const icon = event.type === "failure" ? "❌" : event.type === "reassignment" ? "🔄" : "✅";
         return `
@@ -1136,7 +1136,7 @@ function updateFaultToleranceEventsDisplay() {
             </div>
         `;
     }).join("");
-    
+
     container.innerHTML = eventsHTML;
     container.scrollTop = 0;
 }
@@ -1147,14 +1147,14 @@ function updateHealthStatus() {
     const connectionState = document.getElementById("connectionState");
     const tasksCompletedEl = document.getElementById("tasksCompleted");
     const tasksFailedEl = document.getElementById("tasksFailed");
-    
+
     if (!healthIndicator || !healthStatus) return;
-    
+
     // Determine health based on connections
     const hasActiveConnections = Object.keys(connectedPeers).length > 0;
     const wsConnected = ws.readyState === WebSocket.OPEN;
     const wsConnecting = ws.readyState === WebSocket.CONNECTING;
-    
+
     // If we've never connected, we're still in initial state (connecting/healthy)
     if (!hasEverConnected) {
         if (wsConnecting) {
@@ -1203,10 +1203,10 @@ function updateHealthStatus() {
             connectionState.style.color = "#90EE90";
         }
     }
-    
+
     if (tasksCompletedEl) tasksCompletedEl.textContent = tasksCompleted;
     if (tasksFailedEl) tasksFailedEl.textContent = tasksFailed;
-    
+
     // Redraw network to show health status
     if (latestPeers && latestPeers.length > 0) {
         drawNetwork(latestPeers);
@@ -1218,7 +1218,7 @@ function simulateWorkerFailure() {
         // Recovery simulation
         workerHealth = "recovering";
         addFaultToleranceEvent("recovery", "Worker recovery initiated...");
-        
+
         setTimeout(() => {
             workerHealth = "healthy";
             addFaultToleranceEvent("recovery", "Worker recovered successfully!");
@@ -1228,7 +1228,7 @@ function simulateWorkerFailure() {
         // Failure simulation
         workerHealth = "failed";
         addFaultToleranceEvent("failure", "Worker failure simulated for demonstration");
-        
+
         // Close all data channels to simulate failure
         Object.keys(dataChannels).forEach(peerId => {
             const channel = dataChannels[peerId];
@@ -1236,14 +1236,14 @@ function simulateWorkerFailure() {
                 channel.close();
             }
         });
-        
+
         // Close WebSocket connection
         if (ws.readyState === WebSocket.OPEN) {
             ws.close();
         }
-        
+
         updateHealthStatus();
-        
+
         // Show reassignment message after a delay
         setTimeout(() => {
             addFaultToleranceEvent("reassignment", "Tasks being reassigned to other workers...");
