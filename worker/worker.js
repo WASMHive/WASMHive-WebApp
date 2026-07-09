@@ -5,7 +5,8 @@ let peerConnections = {}; // { peerId: RTCPeerConnection }
 let dataChannels = {}; // { peerId: RTCDataChannel }
 let connectedPeers = {}; // { peerId: true } when data channel is open
 let computeHistory = []; // Store compute task history
-let moduleCache = {}; // { job_id: loaded WASM module }
+let moduleCache = {}; // { module_hash: Promise<wasm module> } persists across jobs
+let pendingModuleWaits = {}; // { module_hash: { resolve, reject, timer } }
 let latestPeers = []; // Cache latest peer list for redraws
 let latestAllocation = null; // Cache latest allocation payload
 
@@ -25,6 +26,8 @@ const FRAME_MAGIC = 0xa5;
 const PROTO_VERSION = 1;
 const FRAME_TASK = 1;
 const FRAME_RESULT = 2;
+const FRAME_MODULE = 3;
+const FRAME_CONTROL = 4;
 const MAX_FRAME_PAYLOAD = 60000;
 const BUFFERED_HIGH_WATER = 4 * 1024 * 1024;
 
@@ -325,6 +328,8 @@ function setupDataChannel(channel, peerId) {
         if (payload === null) return;
         if (frame.ftype === FRAME_TASK) {
             await handleTask(payload, channel);
+        } else if (frame.ftype === FRAME_MODULE) {
+            handleModulePayload(payload);
         } else {
             console.warn("⚠️ Unexpected frame type", frame.ftype, "from", peerId);
         }
@@ -614,6 +619,65 @@ async function loadSeparateWasmModule(wasmBytes, jsGlue) {
     }
 }
 
+// ===== Module cache (content-hash keyed, pulled from the master on demand) =====
+
+// Module payload: [u32 hash_len][hash][u32 wasm_len][wasm][u32 glue_len][glue]
+function handleModulePayload(bytes) {
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    let pos = 0;
+    const hashLen = view.getUint32(pos, true);
+    pos += 4;
+    const hash = new TextDecoder().decode(bytes.subarray(pos, pos + hashLen));
+    pos += hashLen;
+    const wasmLen = view.getUint32(pos, true);
+    pos += 4;
+    const wasm = bytes.slice(pos, pos + wasmLen);
+    pos += wasmLen;
+    const glueLen = view.getUint32(pos, true);
+    pos += 4;
+    const glue = new TextDecoder().decode(bytes.subarray(pos, pos + glueLen));
+
+    console.log(`📦 Module ${hash.slice(0, 12)} received (${wasm.length} bytes)`);
+    const loading = loadSeparateWasmModule(wasm, glue);
+    const wait = pendingModuleWaits[hash];
+    if (wait) {
+        clearTimeout(wait.timer);
+        delete pendingModuleWaits[hash];
+        loading.then(wait.resolve, wait.reject);
+    } else {
+        moduleCache[hash] = loading; // unsolicited but welcome
+    }
+}
+
+// Resolve a module by content hash, requesting it from the master if this
+// worker has never seen it. The cache survives across jobs, so repeat jobs
+// with an unchanged module transfer nothing.
+function ensureModule(channel, moduleHash) {
+    let promise = moduleCache[moduleHash];
+    if (promise) return promise;
+
+    promise = new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+            if (pendingModuleWaits[moduleHash]) {
+                delete pendingModuleWaits[moduleHash];
+                delete moduleCache[moduleHash];
+                reject(new Error(`module ${moduleHash.slice(0, 12)} did not arrive within 30s`));
+            }
+        }, 30000);
+        pendingModuleWaits[moduleHash] = { resolve, reject, timer };
+    });
+    moduleCache[moduleHash] = promise;
+
+    console.log(`📡 Requesting module ${moduleHash.slice(0, 12)} from master`);
+    const request = new TextEncoder().encode(
+        JSON.stringify({ type: "need_module", module_hash: moduleHash })
+    );
+    sendPayloadFrames(channel, FRAME_CONTROL, "ctl_" + moduleHash.slice(0, 16), request).catch(
+        (e) => console.error("❌ Failed to request module:", e)
+    );
+    return promise;
+}
+
 // ===== Task execution =====
 
 // Coerce whatever a map function returned into a Uint8Array.
@@ -659,33 +723,15 @@ async function handleTask(payloadBytes, channel) {
         header = task.header;
         console.log(
             `🦀 Task ${header.task_id} (chunk ${header.chunk_index}, fn ${header.map_function}, ` +
-            `input ${task.input.length} bytes, module ${task.wasm.length ? "included" : "cached"})`
+            `input ${task.input.length} bytes, module ${(header.module_hash || "?").slice(0, 12)})`
         );
 
-        // The cache stores the loading PROMISE, installed synchronously before
-        // the first await, so concurrent tasks of the same job share one load
-        // instead of racing past a cache miss.
-        let modulePromise = moduleCache[header.job_id];
-        if (!modulePromise) {
-            if (task.wasm.length > 0) {
-                modulePromise = loadSeparateWasmModule(task.wasm, task.glue).then((m) => {
-                    console.log(`✅ WASM module cached for job ${header.job_id}`);
-                    return m;
-                });
-                moduleCache[header.job_id] = modulePromise;
-            } else {
-                // The module may still be in flight in another task's transfer
-                // (e.g. after a reassignment); wait briefly before giving up.
-                for (let waited = 0; waited < 10000 && !moduleCache[header.job_id]; waited += 200) {
-                    await new Promise((resolve) => setTimeout(resolve, 200));
-                }
-                modulePromise = moduleCache[header.job_id];
-                if (!modulePromise) {
-                    throw new Error(`no cached module for job ${header.job_id} and task carried none`);
-                }
-            }
+        // Tasks reference their module by content hash; inline module bytes
+        // are accepted too (future small-module optimization).
+        if (task.wasm.length > 0 && !moduleCache[header.module_hash]) {
+            moduleCache[header.module_hash] = loadSeparateWasmModule(task.wasm, task.glue);
         }
-        const wasmModule = await modulePromise;
+        const wasmModule = await ensureModule(channel, header.module_hash);
 
         const mapFn = wasmModule[header.map_function];
         if (typeof mapFn !== "function") {
