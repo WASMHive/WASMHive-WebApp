@@ -23,7 +23,7 @@ Then open `worker/index.html` in one or more browser tabs. Each tab is one worke
 
 ## Branches
 
-- `result-chunking`: chunked worker-to-master results for large payloads (big video frames), pending merge into the unified transport work tracked in the [runtime roadmap](https://github.com/WASMHive/WASMHive-Runtime/blob/main/docs/roadmap.md).
+- `result-chunking`: kept for history. Superseded by the binary framed protocol on main, which chunks transfers in both directions with backpressure (see the [runtime protocol spec](https://github.com/WASMHive/WASMHive-Runtime/blob/main/docs/architecture.md)).
 
 ## 📄 License
 
