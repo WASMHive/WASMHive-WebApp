@@ -5,7 +5,7 @@ let peerConnections = {}; // { peerId: RTCPeerConnection }
 let dataChannels = {}; // { peerId: RTCDataChannel }
 let connectedPeers = {}; // { peerId: true } when data channel is open
 let computeHistory = []; // Store compute task history
-let wasmCache = {}; // { mapFunction: wasmModule }
+let moduleCache = {}; // { job_id: loaded WASM module }
 let latestPeers = []; // Cache latest peer list for redraws
 let latestAllocation = null; // Cache latest allocation payload
 
@@ -20,8 +20,16 @@ let hasEverConnected = false; // Track if we've ever had a successful connection
 // SVG topology elements
 const networkSvg = document.getElementById("networkSvg");
 
-// Chunk reassembly buffer: { chunk_id: { chunks: Map<index, data>, total_chunks, received_chunks } }
-let chunkBuffers = {};
+// ===== Binary wire protocol constants (mirrors distribute_runtime/src/protocol.rs) =====
+const FRAME_MAGIC = 0xa5;
+const PROTO_VERSION = 1;
+const FRAME_TASK = 1;
+const FRAME_RESULT = 2;
+const MAX_FRAME_PAYLOAD = 60000;
+const BUFFERED_HIGH_WATER = 4 * 1024 * 1024;
+
+// In-flight transfer reassembly: { transfer_id: { total, parts, received } }
+let transfers = {};
 
 // WebSocket connection setup
 ws.onopen = () => {
@@ -72,10 +80,6 @@ ws.onmessage = (message) => {
                 new RTCIceCandidate(data.candidate),
             ).catch(console.error);
         }
-    }
-    if (data.type === "directTask") {
-        // Handle direct task from master via WebSocket
-        handleDirectTask(data);
     }
 };
 
@@ -286,6 +290,8 @@ function handleOffer(data) {
 }
 
 function setupDataChannel(channel, peerId) {
+    channel.binaryType = "arraybuffer";
+
     channel.onopen = () => {
         console.log("Data channel open with", peerId);
         connectedPeers[peerId] = true;
@@ -302,107 +308,25 @@ function setupDataChannel(channel, peerId) {
     };
 
     channel.onmessage = async (event) => {
-        console.log(`🔔 Worker ${myId} received data channel message from ${peerId}`);
-        console.log(`   📏 Message length: ${event.data.length} bytes`);
-        console.log(`   📝 First 200 chars:`, event.data.substring(0, 200));
-
         if (typeof event.data === "string") {
-            try {
-                const msg = JSON.parse(event.data);
-                console.log(`   ✅ Parsed JSON successfully`);
-                console.log(`   🔑 Message keys:`, Object.keys(msg));
-
-                // Check if this is a chunk message
-                if (msg.chunk_id !== undefined && msg.chunk_index !== undefined && msg.total_chunks !== undefined) {
-                    console.log(`📦 Received chunk ${msg.chunk_index + 1}/${msg.total_chunks} for ${msg.chunk_id}`);
-
-                    // Initialize buffer for this chunk_id if needed
-                    if (!chunkBuffers[msg.chunk_id]) {
-                        chunkBuffers[msg.chunk_id] = {
-                            chunks: new Map(),
-                            total_chunks: msg.total_chunks,
-                            received_chunks: 0
-                        };
-                    }
-
-                    // Store this chunk
-                    const buffer = chunkBuffers[msg.chunk_id];
-                    buffer.chunks.set(msg.chunk_index, msg.data);
-                    buffer.received_chunks++;
-
-                    console.log(`   📊 Buffer status: ${buffer.received_chunks}/${buffer.total_chunks} chunks received`);
-
-                    // Check if all chunks are received
-                    if (buffer.received_chunks === buffer.total_chunks) {
-                        console.log(`✅ All chunks received for ${msg.chunk_id}, reassembling...`);
-
-                        // Reassemble chunks in order
-                        let fullData = '';
-                        for (let i = 0; i < buffer.total_chunks; i++) {
-                            const chunkData = buffer.chunks.get(i);
-                            if (!chunkData) {
-                                console.error(`❌ Missing chunk ${i} for ${msg.chunk_id}`);
-                                delete chunkBuffers[msg.chunk_id];
-                                return;
-                            }
-                            // Decode base64 chunk
-                            const decodedChunk = atob(chunkData);
-                            fullData += decodedChunk;
-                        }
-
-                        console.log(`   📏 Reassembled message: ${fullData.length} bytes`);
-
-                        // Clean up chunk buffer
-                        delete chunkBuffers[msg.chunk_id];
-
-                        // Parse and process the reassembled message
-                        try {
-                            const reassembledMsg = JSON.parse(fullData);
-                            console.log(`📨 Parsed reassembled message`);
-
-                            // Process the reassembled message as normal
-                            if (reassembledMsg.type === "computeTask") {
-                                console.log(`⚡ Executing computeTask (OLD FORMAT)...`);
-                                await handleComputeTask(reassembledMsg, peerId);
-                            } else if (reassembledMsg.task_id && reassembledMsg.data_chunk) {
-                                console.log(`⚡ Executing Rust WebRTC task (NEW FORMAT)...`);
-                                await handleRustWebRTCTask(reassembledMsg, channel);
-                            } else if (reassembledMsg.task_id && reassembledMsg.data_chunk_b64) {
-                                console.log(`🧪 Executing byte-based Rust WebRTC task (BINARY FORMAT)...`);
-                                await handleRustWebRTCTaskBytes(reassembledMsg, channel);
-                            } else {
-                                console.log(`❓ Unknown reassembled message type:`, reassembledMsg);
-                            }
-                        } catch (e) {
-                            console.error("❌ Error parsing reassembled message:", e);
-                        }
-                    }
-
-                    return; // Chunk message handled
-                }
-
-                // Not a chunk message, handle normally
-                console.log(`📨 Parsed message:`, msg);
-                console.log(`🔍 Debug - msg.type: "${msg.type}", msg.task_id: "${msg.task_id}", msg.data_chunk exists: ${!!msg.data_chunk}, msg.map_function: "${msg.map_function}"`);
-
-                if (msg.type === "computeTask") {
-                    console.log(`⚡ Executing computeTask (OLD FORMAT)...`);
-                    await handleComputeTask(msg, peerId);
-                } else if (msg.task_id && msg.data_chunk) {
-                    console.log(`⚡ Executing Rust WebRTC task (NEW FORMAT)...`);
-                    // Handle Rust WebRTC task format
-                    await handleRustWebRTCTask(msg, channel);
-                } else if (msg.task_id && msg.data_chunk_b64) {
-                    console.log(`🧪 Executing byte-based Rust WebRTC task (BINARY FORMAT)...`);
-                    await handleRustWebRTCTaskBytes(msg, channel);
-                } else {
-                    console.log(`❓ Unknown message type:`, msg);
-                }
-            } catch (e) {
-                console.error("❌ Error parsing message:", e);
-            }
+            console.log("ℹ️ Ignoring non-protocol text message from", peerId);
+            return;
+        }
+        let buf = event.data;
+        if (typeof Blob !== "undefined" && buf instanceof Blob) {
+            buf = await buf.arrayBuffer(); // Safari may deliver Blobs
+        }
+        const frame = decodeFrame(buf);
+        if (!frame) {
+            console.warn("⚠️ Dropped malformed frame from", peerId);
+            return;
+        }
+        const payload = acceptFrame(frame);
+        if (payload === null) return;
+        if (frame.ftype === FRAME_TASK) {
+            await handleTask(payload, channel);
         } else {
-            console.log(`📦 Received non-string data:`, typeof event.data);
+            console.warn("⚠️ Unexpected frame type", frame.ftype, "from", peerId);
         }
     };
 
@@ -558,84 +482,101 @@ function drawNetwork(peers) {
     });
 }
 
-// Helper: Convert Base64 to ArrayBuffer
-function base64ToArrayBuffer(base64) {
-    const binary_string = window.atob(base64);
-    const len = binary_string.length;
-    const bytes = new Uint8Array(len);
-    for (let i = 0; i < len; i++) {
-        bytes[i] = binary_string.charCodeAt(i);
-    }
-    return bytes.buffer;
+// ===== Binary frame codec (mirrors distribute_runtime/src/protocol.rs) =====
+
+// Frame: [magic u8][version u8][ftype u8][reserved u8]
+//        [id_len u16 LE][transfer id][frame_seq u32 LE][total_frames u32 LE]
+//        [payload_len u32 LE][payload]
+function encodeFrame(ftype, transferId, seq, total, payload) {
+    const idBytes = new TextEncoder().encode(transferId);
+    const buf = new ArrayBuffer(4 + 2 + idBytes.length + 12 + payload.length);
+    const view = new DataView(buf);
+    const u8 = new Uint8Array(buf);
+    u8[0] = FRAME_MAGIC;
+    u8[1] = PROTO_VERSION;
+    u8[2] = ftype;
+    u8[3] = 0;
+    view.setUint16(4, idBytes.length, true);
+    u8.set(idBytes, 6);
+    const pos = 6 + idBytes.length;
+    view.setUint32(pos, seq, true);
+    view.setUint32(pos + 4, total, true);
+    view.setUint32(pos + 8, payload.length, true);
+    u8.set(payload, pos + 12);
+    return buf;
 }
 
-// Helper: Convert Uint8Array to Base64 without stack overflow
-function uint8ToBase64(bytes) {
-    const chunkSize = 0x8000; // 32KB per chunk
-    let binary = '';
-    for (let i = 0; i < bytes.length; i += chunkSize) {
-        const sub = bytes.subarray(i, i + chunkSize);
-        binary += String.fromCharCode.apply(null, sub);
-    }
-    return btoa(binary);
+function decodeFrame(buf) {
+    if (!(buf instanceof ArrayBuffer) || buf.byteLength < 4) return null;
+    const u8 = new Uint8Array(buf);
+    const view = new DataView(buf);
+    if (u8[0] !== FRAME_MAGIC || u8[1] !== PROTO_VERSION) return null;
+    const ftype = u8[2];
+    const idLen = view.getUint16(4, true);
+    let pos = 6 + idLen;
+    if (buf.byteLength < pos + 12) return null;
+    const transferId = new TextDecoder().decode(u8.subarray(6, 6 + idLen));
+    const seq = view.getUint32(pos, true);
+    const total = view.getUint32(pos + 4, true);
+    const payloadLen = view.getUint32(pos + 8, true);
+    if (buf.byteLength < pos + 12 + payloadLen) return null;
+    const payload = u8.subarray(pos + 12, pos + 12 + payloadLen);
+    return { ftype, transferId, seq, total, payload };
 }
 
-// Encode RGBA bytes to PNG (base64) using Canvas/OffscreenCanvas
-async function rgbaToPngBase64(rgbaBytes, width, height) {
-    try {
-        // Validate buffer size
-        const expectedSize = width * height * 4;
-        if (rgbaBytes.length !== expectedSize) {
-            console.warn(`⚠️ Buffer size mismatch: expected ${expectedSize}, got ${rgbaBytes.length}`);
-            // Try to adjust if buffer is larger (might have padding)
-            if (rgbaBytes.length > expectedSize) {
-                rgbaBytes = rgbaBytes.slice(0, expectedSize);
-            } else {
-                throw new Error(`Buffer too small: ${rgbaBytes.length} < ${expectedSize}`);
-            }
-        }
-
-        let canvas;
-        let ctx;
-        if (typeof OffscreenCanvas !== 'undefined') {
-            canvas = new OffscreenCanvas(width, height);
-            ctx = canvas.getContext('2d');
-        } else {
-            const c = document.createElement('canvas');
-            c.width = width;
-            c.height = height;
-            canvas = c;
-            ctx = canvas.getContext('2d');
-        }
-
-        const imageData = new ImageData(width, height);
-        imageData.data.set(rgbaBytes);
-        ctx.putImageData(imageData, 0, 0);
-
-        const blob = await new Promise((resolve) => {
-            if (canvas.convertToBlob) {
-                canvas.convertToBlob({ type: 'image/png' }).then(resolve);
-            } else {
-                canvas.toBlob(resolve, 'image/png');
-            }
-        });
-        const arrayBuffer = await blob.arrayBuffer();
-        return uint8ToBase64(new Uint8Array(arrayBuffer));
-    } catch (e) {
-        console.error('PNG encode failed, returning raw base64 as fallback', e);
-        return uint8ToBase64(rgbaBytes);
+// Collect frames until a transfer completes; returns the payload or null.
+function acceptFrame(frame) {
+    if (frame.total === 0 || frame.seq >= frame.total) return null;
+    let t = transfers[frame.transferId];
+    if (!t) {
+        t = transfers[frame.transferId] = {
+            total: frame.total,
+            parts: new Array(frame.total).fill(null),
+            received: 0,
+        };
     }
+    if (t.total !== frame.total) {
+        delete transfers[frame.transferId];
+        return null;
+    }
+    if (t.parts[frame.seq] === null) {
+        t.parts[frame.seq] = frame.payload.slice(); // copy out of the event buffer
+        t.received++;
+    }
+    if (t.received < t.total) return null;
+    delete transfers[frame.transferId];
+    let size = 0;
+    for (const p of t.parts) size += p.length;
+    const out = new Uint8Array(size);
+    let pos = 0;
+    for (const p of t.parts) {
+        out.set(p, pos);
+        pos += p.length;
+    }
+    return out;
 }
 
-// Helper: Convert Uint8Array to Base64 without stack overflow
-function uint8ToBase64(bytes) {
-    const chunkSize = 0x8000; // 32KB per chunk
-    let binary = '';
-    for (let i = 0; i < bytes.length; i += chunkSize) {
-        const sub = bytes.subarray(i, i + chunkSize);
-        binary += String.fromCharCode.apply(null, sub);
-    }
-    return btoa(binary);
+// Task payload: [u32 header_len][header json][u32 wasm_len][wasm]
+//               [u32 glue_len][glue][u32 input_len][input]
+function parseTaskPayload(bytes) {
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    let pos = 0;
+    const headerLen = view.getUint32(pos, true);
+    pos += 4;
+    const header = JSON.parse(new TextDecoder().decode(bytes.subarray(pos, pos + headerLen)));
+    pos += headerLen;
+    const wasmLen = view.getUint32(pos, true);
+    pos += 4;
+    const wasm = bytes.slice(pos, pos + wasmLen);
+    pos += wasmLen;
+    const glueLen = view.getUint32(pos, true);
+    pos += 4;
+    const glue = new TextDecoder().decode(bytes.subarray(pos, pos + glueLen));
+    pos += glueLen;
+    const inputLen = view.getUint32(pos, true);
+    pos += 4;
+    const input = bytes.slice(pos, pos + inputLen);
+    return { header, wasm, glue, input };
 }
 
 // Load separate WASM module and JS glue
@@ -673,428 +614,139 @@ async function loadSeparateWasmModule(wasmBytes, jsGlue) {
     }
 }
 
-// Handle compute task received from master
-async function handleComputeTask(msg, peerId) {
-    console.log("Received compute task from", peerId, msg);
+// ===== Task execution =====
 
-    try {
-        console.log("🦀 Executing separate WASM computation...");
+// Coerce whatever a map function returned into a Uint8Array.
+function coerceToU8(result) {
+    if (result instanceof Uint8Array) return result;
+    if (ArrayBuffer.isView(result)) {
+        return new Uint8Array(result.buffer, result.byteOffset, result.byteLength);
+    }
+    if (result instanceof ArrayBuffer) return new Uint8Array(result);
+    throw new Error("map function returned " + typeof result + ", expected bytes");
+}
 
-        // Load separate WASM module and JS glue
-        const wasmModule = await loadSeparateWasmModule(new Uint8Array(msg.wasm_module), msg.js_glue);
+// Result payload: [u32 header_len][header json][body bytes]
+function buildResultPayload(header, body) {
+    const headerBytes = new TextEncoder().encode(JSON.stringify(header));
+    const out = new Uint8Array(4 + headerBytes.length + body.length);
+    new DataView(out.buffer).setUint32(0, headerBytes.length, true);
+    out.set(headerBytes, 4);
+    out.set(body, 4 + headerBytes.length);
+    return out;
+}
 
-        let result;
-
-        // NEW FORMAT: Use map_function field directly (preferred)
-        if (msg.map_function) {
-            console.log(`🔄 Using NEW format with map_function: ${msg.map_function}`);
-            const mapFunction = msg.map_function; // "cpu_map", "gpu_map", or "cpu1_map"
-
-            if (mapFunction === "cpu_map") {
-                // Execute cpu_map on each element
-                result = [];
-                for (const num of msg.data_chunk || msg.dataChunk) {
-                    const mapped = wasmModule.cpu_map(num);
-                    result.push(mapped);
-                }
-            } else if (mapFunction === "gpu_map") {
-                // Execute gpu_map with batch async WebGPU processing
-                const gpuResult = await wasmModule.gpu_map(msg.data_chunk || msg.dataChunk);
-                // Convert Float32Array to regular Array for JSON serialization
-                result = Array.isArray(gpuResult) ? gpuResult : Array.from(gpuResult);
-            } else if (mapFunction === "cpu1_map") {
-                // Execute cpu1_map on each element (x³)
-                result = [];
-                for (const num of msg.data_chunk || msg.dataChunk) {
-                    const mapped = wasmModule.cpu1_map(num);
-                    result.push(mapped);
-                }
-            } else {
-                throw new Error(`Unknown map function: ${mapFunction}`);
-            }
-
-            console.log(`✅ NEW format WASM execution completed. Input: [${(msg.data_chunk || msg.dataChunk).join(',')}] -> Output: [${result.join(',')}]`);
-            console.log(`   📊 Result type: ${typeof result}, Array: ${Array.isArray(result)}, Length: ${result?.length}`);
-        } else {
-            // OLD FORMAT: Legacy execution mode logic (fallback)
-            console.log(`⚠️ Using OLD format with execution_mode`);
-            const executionMode = msg.execution_mode || msg.executionMode || "CPU";
-            const baseFunctionName = msg.function_name || msg.functionName || "simple_map_reduce";
-            let functionName;
-
-            if (executionMode === "GPU") {
-                functionName = `${baseFunctionName}_gpu_wasm`;
-
-                if (!wasmModule[functionName]) {
-                    throw new Error(`Function ${functionName} not found in WASM module`);
-                }
-
-                // Prepare input for GPU WASM function (expects JSON string)
-                const input = {
-                    numbers: msg.data_chunk || msg.dataChunk,
-                    execution_mode: executionMode
-                };
-                const inputJson = JSON.stringify(input);
-
-                // Call GPU WASM function (async) and parse result
-                const resultJson = await wasmModule[functionName](inputJson);
-                const parsedResult = JSON.parse(resultJson);
-                result = parsedResult.value;
-            } else {
-                // CPU execution
-                functionName = `${baseFunctionName}_wasm`;
-
-                if (!wasmModule[functionName]) {
-                    throw new Error(`Function ${functionName} not found in WASM module`);
-                }
-
-                // Prepare input for CPU WASM function (expects JSON string)
-                const input = {
-                    numbers: msg.data_chunk || msg.dataChunk,
-                    execution_mode: executionMode
-                };
-                const inputJson = JSON.stringify(input);
-
-                // Call CPU WASM function and parse result
-                const resultJson = wasmModule[functionName](inputJson);
-                const parsedResult = JSON.parse(resultJson);
-                result = parsedResult.value;
-            }
+// Send a payload as protocol frames with bufferedAmount backpressure.
+async function sendPayloadFrames(channel, ftype, transferId, payload) {
+    const total = Math.max(1, Math.ceil(payload.length / MAX_FRAME_PAYLOAD));
+    for (let seq = 0; seq < total; seq++) {
+        while (channel.bufferedAmount > BUFFERED_HIGH_WATER) {
+            await new Promise((resolve) => setTimeout(resolve, 10));
         }
-
-        console.log("✅ Separate WASM execution completed successfully");
-
-        // Add to compute history
-        addToComputeHistory({
-            taskId: msg.taskId || msg.task_id,
-            dataChunk: msg.dataChunk || msg.data_chunk,
-            result: result,
-            mode: msg.execution_mode || msg.executionMode || "CPU",
-            communication: "Separate WASM"
-        });
-
-        // Send result back to master
-        const resultMessage = {
-            type: "computeResult",
-            taskId: msg.taskId,
-            result: result,
-            workerId: myId
-        };
-
-        if (dataChannels[peerId] && dataChannels[peerId].readyState === "open") {
-            dataChannels[peerId].send(JSON.stringify(resultMessage));
-            console.log("✅ Sent compute result:", resultMessage);
-        }
-
-    } catch (error) {
-        console.error("❌ Error processing compute task:", error);
-
-        // Send error back to master (no fallback - require WASM)
-        const errorMessage = {
-            type: "computeResult",
-            taskId: msg.taskId,
-            result: [],
-            workerId: myId,
-            error: error.message
-        };
-
-        if (dataChannels[peerId] && dataChannels[peerId].readyState === "open") {
-            dataChannels[peerId].send(JSON.stringify(errorMessage));
-        }
+        const start = seq * MAX_FRAME_PAYLOAD;
+        const chunk = payload.subarray(start, Math.min(start + MAX_FRAME_PAYLOAD, payload.length));
+        channel.send(encodeFrame(ftype, transferId, seq, total, chunk));
     }
 }
 
-// Handle direct task from master via WebSocket (legacy - should use WebRTC)
-async function handleDirectTask(msg) {
-    console.log("⚠️ Received direct task via WebSocket - this should use WebRTC instead");
-
-    // Send error back indicating WebRTC should be used
-    const errorMessage = {
-        type: "taskResult",
-        to: msg.from,
-        taskId: msg.taskId,
-        result: [],
-        error: "Direct WebSocket tasks not supported - use WebRTC with WASM",
-        workerId: myId
-    };
-
-    ws.send(JSON.stringify(errorMessage));
-}
-
-// Handle Rust WebRTC task format
-async function handleRustWebRTCTask(msg, channel) {
-    console.log("🦀 Worker received Rust WebRTC task:", msg);
-
+// Execute one task: load/reuse the job's WASM module, call the named map
+// function with (bytes, meta), send the returned bytes back. Any failure is
+// reported to the master as an error result so the task can be reassigned.
+async function handleTask(payloadBytes, channel) {
+    let header = null;
     try {
-        // Determine which WASM function to call
-        const mapFunction = msg.map_function; // "cpu_map", "gpu_map", or "cpu1_map"
-        console.log(`📊 Executing WASM function: ${mapFunction}`);
+        const task = parseTaskPayload(payloadBytes);
+        header = task.header;
+        console.log(
+            `🦀 Task ${header.task_id} (chunk ${header.chunk_index}, fn ${header.map_function}, ` +
+            `input ${task.input.length} bytes, module ${task.wasm.length ? "included" : "cached"})`
+        );
 
-        // Load or reuse WASM module (optimization: cache WASM to avoid reloading)
-        let wasmModule = wasmCache[mapFunction];
-        if (!wasmModule && msg.wasm_module && msg.wasm_module.length > 0) {
-            console.log("🔧 Loading WASM module and executing map function...");
-            // Decode base64 WASM module
-            const wasmBytes = base64ToArrayBuffer(msg.wasm_module);
-            // Load WASM module with JS glue
-            wasmModule = await loadSeparateWasmModule(wasmBytes, msg.js_glue);
-            // Cache the loaded module
-            wasmCache[mapFunction] = wasmModule;
-            console.log("✅ WASM module loaded and cached");
-        } else if (wasmModule) {
-            console.log("♻️  Reusing cached WASM module");
-        } else {
-            throw new Error(`No WASM module provided and no cached module for ${mapFunction}`);
-        }
-
-        let result;
-
-        if (mapFunction === "cpu_map") {
-            // Execute cpu_map on each element
-            result = [];
-            for (const num of msg.data_chunk) {
-                const mapped = wasmModule.cpu_map(num);
-                result.push(mapped);
-            }
-        } else if (mapFunction === "gpu_map") {
-            // Execute gpu_map with batch async WebGPU processing
-            // Check if WebGPU is available first
-            if (typeof navigator !== 'undefined' && navigator.gpu) {
-                try {
-                    result = await wasmModule.gpu_map(msg.data_chunk);
-                } catch (gpuError) {
-                    console.error("❌ GPU execution failed, falling back to CPU:", gpuError);
-                    console.error("   Error details:", gpuError.message, gpuError.stack);
-                    // Fallback to CPU if GPU fails
-                    result = [];
-                    for (const num of msg.data_chunk) {
-                        const mapped = wasmModule.cpu_map(num);
-                        result.push(mapped);
-                    }
-                    console.log("✅ Fallback to CPU completed");
-                }
+        // The cache stores the loading PROMISE, installed synchronously before
+        // the first await, so concurrent tasks of the same job share one load
+        // instead of racing past a cache miss.
+        let modulePromise = moduleCache[header.job_id];
+        if (!modulePromise) {
+            if (task.wasm.length > 0) {
+                modulePromise = loadSeparateWasmModule(task.wasm, task.glue).then((m) => {
+                    console.log(`✅ WASM module cached for job ${header.job_id}`);
+                    return m;
+                });
+                moduleCache[header.job_id] = modulePromise;
             } else {
-                console.warn("⚠️ WebGPU not available, using CPU fallback");
-                // WebGPU not available, use CPU
-                result = [];
-                for (const num of msg.data_chunk) {
-                    const mapped = wasmModule.cpu_map(num);
-                    result.push(mapped);
+                // The module may still be in flight in another task's transfer
+                // (e.g. after a reassignment); wait briefly before giving up.
+                for (let waited = 0; waited < 10000 && !moduleCache[header.job_id]; waited += 200) {
+                    await new Promise((resolve) => setTimeout(resolve, 200));
                 }
-                console.log("✅ CPU execution completed (WebGPU unavailable)");
+                modulePromise = moduleCache[header.job_id];
+                if (!modulePromise) {
+                    throw new Error(`no cached module for job ${header.job_id} and task carried none`);
+                }
             }
-        } else if (mapFunction === "cpu1_map") {
-            // Execute cpu1_map on each element (x³)
-            result = [];
-            for (const num of msg.data_chunk) {
-                const mapped = wasmModule.cpu1_map(num);
-                result.push(mapped);
-            }
-        } else {
-            throw new Error(`Unknown map function: ${mapFunction}`);
+        }
+        const wasmModule = await modulePromise;
+
+        const mapFn = wasmModule[header.map_function];
+        if (typeof mapFn !== "function") {
+            throw new Error(`map function ${header.map_function} not found in module`);
         }
 
-        // Validate result before proceeding
-        if (result === undefined || result === null) {
-            throw new Error("WASM function returned undefined or null result");
-        }
+        let result = mapFn(task.input, header.meta ?? null);
+        if (result instanceof Promise) result = await result;
+        result = coerceToU8(result);
 
-        console.log(`✅ WASM execution completed. Input: [${msg.data_chunk.join(',')}] -> Output: [${result?.join ? result.join(',') : 'invalid'}]`);
-        console.log(`   📊 Result type: ${typeof result}, Array: ${Array.isArray(result)}, Length: ${result?.length}`);
-
-        // Convert Float32Array or other typed arrays to regular Array for JSON serialization
-        let resultArray;
-        if (Array.isArray(result)) {
-            resultArray = result;
-        } else if (result && typeof result.length === 'number') {
-            // Typed array (Float32Array, etc.)
-            resultArray = Array.from(result);
-        } else {
-            throw new Error(`Invalid result type from WASM function: ${typeof result}`);
-        }
-        console.log(`   🔄 Converted to Array: ${Array.isArray(resultArray)}, Length: ${resultArray.length}`);
-
-        // Add to compute history
-        addToComputeHistory({
-            taskId: msg.task_id,
-            dataChunk: msg.data_chunk,
-            result: resultArray,
-            mode: mapFunction,
-            communication: "WASM " + mapFunction
-        });
-
-        // Update fault tolerance stats
         tasksCompleted++;
         updateHealthStatus();
+        addToComputeHistory({
+            taskId: header.task_id,
+            dataChunk: [task.input.length],
+            result: [result.length],
+            mode: header.map_function,
+            communication: "binary WebRTC",
+        });
 
-        // Send result back via WebRTC data channel
-        const resultMessage = {
-            task_id: msg.task_id,
-            result: resultArray,
-            worker_id: myId
-        };
-
-        console.log("📤 Preparing to send result back...");
-        console.log("   🔍 Result message:", resultMessage);
-        console.log("   🔍 Channel state:", channel.readyState);
-
-        try {
-            channel.send(JSON.stringify(resultMessage));
-            console.log("✅ Sent WASM result via WebRTC successfully!");
-        } catch (e) {
-            console.error("❌ Failed to send result:", e);
-        }
-
+        await sendPayloadFrames(
+            channel,
+            FRAME_RESULT,
+            header.task_id,
+            buildResultPayload(
+                {
+                    task_id: header.task_id,
+                    chunk_index: header.chunk_index,
+                    worker_id: myId,
+                    meta: header.meta ?? null,
+                },
+                result
+            )
+        );
+        console.log(`✅ Result for ${header.task_id} sent (${result.length} bytes)`);
     } catch (error) {
-        console.error("❌ Error processing WASM task:", error);
-        console.error("   Error stack:", error.stack);
-
-        // Update fault tolerance stats
+        console.error("❌ Task failed:", error);
         tasksFailed++;
-        addFaultToleranceEvent("failure", `Task ${msg.task_id} failed: ${error.message}`);
+        addFaultToleranceEvent("failure", `Task ${header ? header.task_id : "?"} failed: ${error.message}`);
         updateHealthStatus();
-
-        // Send error back in format that matches WorkerResult enum
-        // Must match Floats variant: { task_id, result, worker_id }
-        // Send empty result array to indicate failure
-        const errorMessage = {
-            task_id: msg.task_id,
-            result: [], // Empty result indicates failure
-            worker_id: myId
-        };
-
-        try {
-            channel.send(JSON.stringify(errorMessage));
-            console.log("✅ Sent error result back to master");
-        } catch (sendError) {
-            console.error("❌ Failed to send error result:", sendError);
-        }
-    }
-}
-
-// Handle byte-based Rust WebRTC task format (e.g., video frames)
-async function handleRustWebRTCTaskBytes(msg, channel) {
-    console.log("🦀 Worker received Rust WebRTC BYTE task:", msg);
-    console.log("   📏 Meta:", msg.meta);
-
-    try {
-        console.log("🔧 Loading WASM module and executing byte map function...");
-
-        // Load or reuse WASM module if needed
-        const mapFunction = msg.map_function;
-        let wasmModule = wasmCache[mapFunction];
-        if (!wasmModule && mapFunction !== 'grayscale_frame_js') {
-            const wasmBytes = base64ToArrayBuffer(msg.wasm_module || "");
-            if (wasmBytes && wasmBytes.byteLength > 0) {
-                wasmModule = await loadSeparateWasmModule(wasmBytes, msg.js_glue || "");
-                wasmCache[mapFunction] = wasmModule;
+        if (header) {
+            try {
+                await sendPayloadFrames(
+                    channel,
+                    FRAME_RESULT,
+                    header.task_id,
+                    buildResultPayload(
+                        {
+                            task_id: header.task_id,
+                            chunk_index: header.chunk_index,
+                            worker_id: myId,
+                            error: String(error.message || error),
+                            meta: header.meta ?? null,
+                        },
+                        new Uint8Array(0)
+                    )
+                );
+            } catch (sendError) {
+                console.error("❌ Could not report task failure:", sendError);
             }
         }
-
-        // Decode data chunk
-        const chunkArrayBuffer = base64ToArrayBuffer(msg.data_chunk_b64);
-        const chunkBytes = new Uint8Array(chunkArrayBuffer);
-
-        // Determine function
-        if (mapFunction !== 'grayscale_frame_js' && (!wasmModule || !wasmModule[mapFunction])) {
-            throw new Error(`Unknown byte map function: ${mapFunction}`);
-        }
-
-        let resultBytes;
-        if (mapFunction === 'grayscale_frame_js') {
-            // JS fallback grayscale: in-place over RGBA
-            resultBytes = chunkBytes.slice();
-            for (let i = 0; i + 3 < resultBytes.length; i += 4) {
-                const r = resultBytes[i];
-                const g = resultBytes[i + 1];
-                const b = resultBytes[i + 2];
-                const gray = (0.299 * r + 0.587 * g + 0.114 * b) | 0;
-                resultBytes[i] = gray;
-                resultBytes[i + 1] = gray;
-                resultBytes[i + 2] = gray;
-            }
-        } else {
-            // Try calling with (bytes, meta); extra args are ignored if not needed
-            const possible = wasmModule[mapFunction](chunkBytes, msg.meta);
-            if (possible instanceof Promise) {
-                resultBytes = await possible;
-            } else {
-                resultBytes = possible;
-            }
-        }
-
-        // Ensure Uint8Array
-        if (!(resultBytes instanceof Uint8Array)) {
-            if (ArrayBuffer.isView(resultBytes)) {
-                resultBytes = new Uint8Array(resultBytes.buffer);
-            } else if (resultBytes instanceof ArrayBuffer) {
-                resultBytes = new Uint8Array(resultBytes);
-            } else {
-                throw new Error("Byte map function did not return a byte buffer");
-            }
-        }
-
-        // Encode result as PNG base64 to reduce payload size (only for image data)
-        // For non-image data (like text), encode directly as base64
-        const w = (msg.meta && msg.meta.width) || 0;
-        const h = (msg.meta && msg.meta.height) || 0;
-        let resultB64;
-        if (w > 0 && h > 0) {
-            // Image data: encode as PNG
-            console.log(`   🖼️  Encoding PNG: ${w}x${h}, bytes: ${resultBytes.length}`);
-            resultB64 = await rgbaToPngBase64(resultBytes, w, h);
-            console.log(`   📦 PNG base64 length: ${resultB64.length}`);
-        } else {
-            // Non-image data: encode directly as base64
-            console.log(`   📦 Encoding raw bytes as base64: ${resultBytes.length} bytes`);
-            resultB64 = uint8ToBase64(resultBytes);
-            console.log(`   📦 Base64 length: ${resultB64.length}`);
-        }
-
-        // Send result back with meta echoed
-        const resultMessage = {
-            task_id: msg.task_id,
-            result_b64: resultB64,
-            worker_id: myId,
-            meta: Object.assign({}, msg.meta || null, { format: (w > 0 && h > 0) ? 'png' : 'raw' }),
-        };
-
-        // Wait for send queue to drain before sending large result
-        const resultJson = JSON.stringify(resultMessage);
-        const maxBuffered = 16 * 1024 * 1024; // 16MB
-        while (channel.bufferedAmount > maxBuffered) {
-            console.log(`   ⏳ Waiting for send queue to drain (${channel.bufferedAmount} bytes buffered)...`);
-            await new Promise(resolve => setTimeout(resolve, 100));
-        }
-
-        try {
-            channel.send(resultJson);
-            console.log("✅ Sent BYTE result via WebRTC successfully!");
-            addToComputeHistory({
-                taskId: msg.task_id,
-                dataChunk: [],
-                result: [resultBytes.length],
-                mode: mapFunction,
-                communication: "BYTE WASM",
-            });
-
-            // Update fault tolerance stats
-            tasksCompleted++;
-            updateHealthStatus();
-        } catch (e) {
-            console.error("❌ Failed to send BYTE result:", e);
-        }
-
-    } catch (error) {
-        console.error("❌ Error processing BYTE WASM task:", error);
-        const errorMessage = {
-            task_id: msg.task_id,
-            result_b64: "",
-            error: error.message,
-            worker_id: myId,
-            meta: msg.meta || null,
-        };
-        channel.send(JSON.stringify(errorMessage));
     }
 }
 
