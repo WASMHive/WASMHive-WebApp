@@ -71,17 +71,31 @@ ws.onmessage = (message) => {
         const pc = peerConnections[data.from];
         if (pc) {
             console.log("Received answer from", data.from);
-            pc.setRemoteDescription(
-                new RTCSessionDescription(data.answer),
-            ).catch(console.error);
+            pc.setRemoteDescription(new RTCSessionDescription(data.answer))
+                .then(() => {
+                    // Flush candidates that arrived while the answer was
+                    // still being applied (sub-millisecond on localhost).
+                    const pending = pc.pendingCandidates || [];
+                    pc.pendingCandidates = [];
+                    pending.forEach((candidate) =>
+                        pc.addIceCandidate(candidate).catch((e) =>
+                            console.log(`addIceCandidate failed for ${data.from}: ${e.name}: ${e.message}`)));
+                })
+                .catch((e) =>
+                    console.log(`setRemoteDescription(answer) failed for ${data.from}: ${e.name}: ${e.message}`));
         }
     }
     if (data.type === "candidate") {
         const pc = peerConnections[data.from];
         if (pc) {
-            pc.addIceCandidate(
-                new RTCIceCandidate(data.candidate),
-            ).catch(console.error);
+            const candidate = new RTCIceCandidate(data.candidate);
+            if (!pc.remoteDescription) {
+                // Answer not applied yet: buffer, the answer handler flushes.
+                (pc.pendingCandidates = pc.pendingCandidates || []).push(candidate);
+            } else {
+                pc.addIceCandidate(candidate).catch((e) =>
+                    console.log(`addIceCandidate failed for ${data.from}: ${e.name}: ${e.message}`));
+            }
         }
     }
 };
