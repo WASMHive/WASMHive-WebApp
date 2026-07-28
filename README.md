@@ -7,7 +7,7 @@ The browser side of **WASMHive**: the signaling server that wires the network to
 | Path | What it is |
 |---|---|
 | `server/websocket-server.js` | Signaling server (port 3000): registration, peer lists, WebRTC offer/answer/candidate relay, fair-share allocation broadcast |
-| `server/proxy-server.js` | CORS proxy (port 3001) used by the web-crawl workload so worker tabs can fetch cross-origin pages |
+| `server/proxy-server.js` | CORS proxy (port 3001) used by the web-crawl workload so worker tabs can fetch cross-origin pages: follows redirects, decompresses gzip/brotli, preserves charset headers, rejects bad URLs with a 400 instead of crashing |
 | `worker/index.html` + `worker/worker.js` | The worker node page: connects to signaling, opens WebRTC data channels to masters, executes shipped WASM, streams results back. Shows live network topology, task history, health, and fault-tolerance events |
 
 ## 🚀 Run it
@@ -20,6 +20,10 @@ node proxy-server.js         # optional, needed for the web-crawl example
 ```
 
 Then open `worker/index.html` in one or more browser tabs. Each tab is one worker node. Start a job from [WASMHive-Runtime](https://github.com/WASMHive/WASMHive-Runtime) and watch tasks land on the dashboard.
+
+### Crawl proxy behavior
+
+The proxy follows up to 5 redirects server-side (the browser can't follow cross-origin `Location` headers itself), transparently decompresses gzip/deflate/brotli bodies, forwards the origin's `Content-Type` charset so workers can decode non-UTF-8 pages, sends a crawler `User-Agent`, and times out stalled origins with a 504 (default 20s; tune with `PROXY_TIMEOUT_MS`, change the port with `PORT`). Malformed and non-http(s) URLs get a 400. Worker tabs on **other machines** can't reach `localhost:3001`; start the crawl with `WASMHIVE_PROXY_URL=http://<master-ip>:3001/proxy` (see the Runtime README) so tasks carry a proxy address those workers can reach.
 
 ### Same-machine workers: disable Chrome's mDNS masking
 
