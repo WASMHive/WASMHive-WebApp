@@ -11,6 +11,9 @@ wss.on("connection", (ws) => {
   clients[id] = { ws, type: "unknown" }; // Default to unknown until identified
   console.log(`Client connected: ${id}`);
 
+  // A socket error without a listener would crash the whole server.
+  ws.on("error", (err) => console.warn(`Socket error from ${id}: ${err.message}`));
+
   // Send the welcome message with this client's ID.
   ws.send(JSON.stringify({ type: "welcome", id }));
 
@@ -21,7 +24,13 @@ wss.on("connection", (ws) => {
   broadcastPeerList();
 
   ws.on("message", (message) => {
-    const data = JSON.parse(message);
+    let data;
+    try {
+      data = JSON.parse(message);
+    } catch {
+      console.warn(`Ignoring non-JSON message from ${id}`);
+      return;
+    }
 
     // Handle master registration
     if (data.type === "registerMaster") {
@@ -65,7 +74,12 @@ function broadcastPeerList() {
   const allPeers = Object.keys(clients);
   console.log(`Broadcasting peer list - Workers: [${workerList.join(', ')}], Masters: [${masterList.join(', ')}]`);
 
-  const message = JSON.stringify({ type: "peerList", peers: allPeers });
+  // peerTypes is additive so the Rust master's peers-only parsing is untouched;
+  // workers use it to dial masters instead of every peer.
+  const peerTypes = {};
+  for (const clientId in clients) peerTypes[clientId] = clients[clientId].type;
+
+  const message = JSON.stringify({ type: "peerList", peers: allPeers, peerTypes });
   for (const clientId in clients) {
     clients[clientId].ws.send(message);
   }
@@ -77,6 +91,11 @@ function broadcastPeerList() {
     clients[clientId].ws.send(allocationMessage);
   }
 }
+
+wss.on("error", (err) => {
+  console.error(`WebSocket server failed to start: ${err.message}`);
+  process.exit(1);
+});
 
 console.log("WebSocket server running on ws://localhost:3000");
 
