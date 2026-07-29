@@ -1,5 +1,6 @@
 // Worker Node - receives compute tasks and WASM modules from master via WebRTC
-let ws = new WebSocket("ws://localhost:3000");
+const SIGNALING_URL = "ws://localhost:3000";
+let ws = null; // (re)created by connectSignaling()
 let myId;
 let peerConnections = {}; // { peerId: RTCPeerConnection }
 let dataChannels = {}; // { peerId: RTCDataChannel }
@@ -8,15 +9,23 @@ let computeHistory = []; // Store compute task history
 let moduleCache = {}; // { module_hash: Promise<wasm module> } persists across jobs
 let pendingModuleWaits = {}; // { module_hash: { resolve, reject, timer } }
 let latestPeers = []; // Cache latest peer list for redraws
+let latestPeerTypes = null; // { peerId: "master"|"worker"|"unknown" }, absent on old servers
 let latestAllocation = null; // Cache latest allocation payload
 
+// Connection lifecycle
+let connState = "connecting"; // "connecting" | "online" | "reconnecting" | "down"
+let reconnectAttempt = 0;
+let reconnectTimer = null;
+let keepaliveTimer = null;
+let intentionalClose = false; // set by the failure demo to suppress auto-reconnect
+let announceRecoveryOnWelcome = false;
+
 // Fault tolerance tracking
-let workerHealth = "healthy"; // "healthy", "failed", "recovering", "connecting"
+let workerHealth = "healthy"; // derived from connState in updateHealthStatus
 let tasksCompleted = 0;
 let tasksFailed = 0;
 let faultToleranceEvents = []; // Store fault tolerance events
-let failedWorkers = new Set(); // Track failed workers in network
-let hasEverConnected = false; // Track if we've ever had a successful connection
+let failedWorkers = new Set(); // Peers whose data channel errored while still listed
 
 // SVG topology elements
 const networkSvg = document.getElementById("networkSvg");
@@ -31,35 +40,123 @@ const FRAME_CONTROL = 4;
 const MAX_FRAME_PAYLOAD = 60000;
 const BUFFERED_HIGH_WATER = 4 * 1024 * 1024;
 
-// In-flight transfer reassembly: { transfer_id: { total, parts, received } }
+// In-flight transfer reassembly: { transfer_id: { peerId, total, parts, received } }
 let transfers = {};
 
-// WebSocket connection setup
-ws.onopen = () => {
+// Send JSON over the signaling socket only when it is actually open; sends
+// during reconnect windows are dropped (peer state is rebuilt on reconnect).
+function safeSend(obj) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify(obj));
+        return true;
+    }
+    console.log("safeSend: signaling not open, dropped", obj && obj.type);
+    return false;
+}
+
+// ===== Signaling connection lifecycle =====
+
+function connectSignaling() {
+    if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+    }
+    if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) return;
+    ws = new WebSocket(SIGNALING_URL);
+    ws.onopen = handleWsOpen;
+    ws.onmessage = handleWsMessage;
+    ws.onclose = handleWsClose;
+    ws.onerror = handleWsError;
+    updateHealthStatus();
+}
+
+function scheduleReconnect() {
+    if (intentionalClose || reconnectTimer) return;
+    reconnectAttempt++;
+    const base = Math.min(1000 * 2 ** (reconnectAttempt - 1), 30000);
+    const delay = Math.round(base * (0.75 + Math.random() * 0.5));
+    // Attempt 1 and every 5th afterwards go to the event feed; the status
+    // line updates every attempt without scrolling anything.
+    if (reconnectAttempt === 1 || reconnectAttempt % 5 === 0) {
+        addFaultToleranceEvent("info", `Reconnecting to signaling server (attempt ${reconnectAttempt})`);
+    }
+    const wsEl = document.getElementById("wsStatus");
+    if (wsEl) {
+        wsEl.innerText = `Reconnecting - attempt ${reconnectAttempt} (next in ~${Math.round(delay / 1000)}s)`;
+        wsEl.className = "status disconnected";
+    }
+    reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        connectSignaling();
+    }, delay);
+}
+
+function forceReconnect() {
+    intentionalClose = false;
+    announceRecoveryOnWelcome = true;
+    reconnectAttempt = 0;
+    connState = "reconnecting";
+    connectSignaling();
+}
+
+function startKeepalive() {
+    stopKeepalive();
+    // A send on a dead link eventually errors the socket, which fires onclose
+    // and the backoff loop; without traffic a half-open socket lingers forever.
+    keepaliveTimer = setInterval(() => safeSend({ type: "ping" }), 25000);
+}
+
+function stopKeepalive() {
+    if (keepaliveTimer) {
+        clearInterval(keepaliveTimer);
+        keepaliveTimer = null;
+    }
+}
+
+// Drop every per-peer object. Module cache survives on purpose: modules are
+// content-addressed and stay valid across signaling sessions.
+// pendingModuleWaits entries self-heal via their own 30s timeout.
+function resetPeerState() {
+    Object.keys(peerConnections).forEach((peerId) => teardownPeer(peerId, true));
+    peerConnections = {};
+    dataChannels = {};
+    connectedPeers = {};
+    transfers = {};
+    failedWorkers.clear();
+    latestPeers = [];
+    latestPeerTypes = null;
+    const peerListEl = document.getElementById("peerList");
+    if (peerListEl) peerListEl.innerHTML = "None";
+    const totalEl = document.getElementById("totalPeers");
+    if (totalEl) totalEl.innerText = "0";
+    drawNetwork(latestPeers);
+}
+
+function handleWsOpen() {
     console.log("Worker connected to WebSocket server");
     document.getElementById("wsStatus").innerText = "Connected to signaling server";
     document.getElementById("wsStatus").className = "status connected";
-    hasEverConnected = true;
-    // Explicitly register as a worker for clarity on the signaling server
-    try {
-        ws.send(JSON.stringify({ type: "registerWorker" }));
-    } catch (e) {
-        console.error("Failed to register as worker:", e);
-    }
+    connState = "online";
+    reconnectAttempt = 0;
+    safeSend({ type: "registerWorker" });
+    startKeepalive();
     updateHealthStatus();
-};
+}
 
-ws.onmessage = (message) => {
+function handleWsMessage(message) {
     const data = JSON.parse(message.data);
     console.log("Received WS message:", data);
 
     if (data.type === "welcome") {
         myId = data.id;
         document.getElementById("workerId").innerText = myId;
-        if (data.peers) updatePeerList(data.peers);
+        if (announceRecoveryOnWelcome) {
+            announceRecoveryOnWelcome = false;
+            addFaultToleranceEvent("recovery", `Re-registered with signaling server (new id: ${myId})`);
+        }
     }
     if (data.type === "peerList") {
-        if (myId) updatePeerList(data.peers);
+        if (myId) updatePeerList(data.peers, data.peerTypes);
     }
     if (data.type === "allocation") {
         renderAllocation(data);
@@ -98,50 +195,90 @@ ws.onmessage = (message) => {
             }
         }
     }
-};
+}
 
-ws.onclose = () => {
+function handleWsClose(event) {
+    if (event && event.target !== ws) return; // event from a superseded socket
     console.log("Disconnected from WebSocket signaling server");
-    const el = document.getElementById("wsStatus");
-    if (el) {
-        el.innerText = "Disconnected";
-        el.className = "status disconnected";
+    stopKeepalive();
+    resetPeerState();
+    myId = null;
+    const idEl = document.getElementById("workerId");
+    const wsEl = document.getElementById("wsStatus");
+    if (intentionalClose) {
+        connState = "down";
+        if (idEl) idEl.innerText = "Offline (simulated)";
+        if (wsEl) {
+            wsEl.innerText = "Disconnected - simulated failure";
+            wsEl.className = "status disconnected";
+        }
+    } else {
+        if (connState === "online") {
+            addFaultToleranceEvent("failure", "Signaling connection lost - attempting reconnect");
+            announceRecoveryOnWelcome = true;
+        }
+        connState = "reconnecting";
+        if (idEl) idEl.innerText = "Reconnecting...";
+        scheduleReconnect();
     }
-    addFaultToleranceEvent("failure", "WebSocket connection lost");
     updateHealthStatus();
-};
+}
 
-ws.onerror = (error) => {
+function handleWsError(error) {
+    // One of these fires per failed reconnect attempt; onclose drives the
+    // lifecycle, so this stays log-only to keep the event feed honest.
     console.error("WebSocket error:", error);
-    const el = document.getElementById("wsStatus");
-    if (el) {
-        el.innerText = "Connection Error";
-        el.className = "status disconnected";
+}
+
+// Fully release a peer: close its connection and drop all state keyed by it.
+// Idempotent. Nulling the channel handlers first keeps our own close() from
+// echoing back as a lifecycle event.
+function teardownPeer(peerId, silent) {
+    const channel = dataChannels[peerId];
+    if (channel) {
+        channel.onclose = null;
+        channel.onerror = null;
+        try { channel.close(); } catch (e) { /* already closed */ }
     }
-    addFaultToleranceEvent("failure", "WebSocket connection error");
-    updateHealthStatus();
-};
+    const pc = peerConnections[peerId];
+    if (pc) {
+        try { pc.close(); } catch (e) { /* already closed */ }
+    }
+    delete peerConnections[peerId];
+    delete dataChannels[peerId];
+    delete connectedPeers[peerId];
+    dropTransfersFor(peerId);
+    if (!silent) {
+        updateStatus();
+        updateHealthStatus();
+    }
+}
 
-function updatePeerList(peers) {
+function dropTransfersFor(peerId) {
+    Object.keys(transfers).forEach((transferId) => {
+        if (transfers[transferId].peerId === peerId) delete transfers[transferId];
+    });
+}
+
+// With a role-aware server only masters get dialed; a server that predates
+// peerTypes gets the old dial-everyone behavior.
+function isMasterPeer(peerId) {
+    return !latestPeerTypes || latestPeerTypes[peerId] === "master";
+}
+
+function updatePeerList(peers, peerTypes) {
     const others = peers.filter((id) => id !== myId);
+    latestPeerTypes = peerTypes || null;
 
-    // Track which peers are no longer in the list (they may have failed)
+    // Peers gone from the list have left signaling (normal at job end for
+    // masters): release their state so a later rejoin dials fresh.
     const currentPeerSet = new Set(peers);
     const previousPeerSet = new Set(latestPeers || []);
-
-    // Mark peers that disappeared as failed
     previousPeerSet.forEach(peerId => {
         if (!currentPeerSet.has(peerId) && peerId !== myId) {
-            failedWorkers.add(peerId);
-            addFaultToleranceEvent("failure", `Peer ${peerId} disconnected from network`);
-        }
-    });
-
-    // Remove peers that came back from failed list
-    currentPeerSet.forEach(peerId => {
-        if (failedWorkers.has(peerId) && peerId !== myId) {
+            addFaultToleranceEvent("info", `Peer ${peerId} left the network`);
+            teardownPeer(peerId, true);
             failedWorkers.delete(peerId);
-            addFaultToleranceEvent("recovery", `Peer ${peerId} reconnected`);
         }
     });
 
@@ -168,16 +305,19 @@ function updatePeerList(peers) {
 
     console.log("Worker updating peer list, others:", others);
 
-    // Workers connect to all other peers (masters and workers)
+    // Dial masters only; worker-to-worker channels serve nothing and the
+    // simultaneous double-offer (glare) systematically failed anyway.
     others.forEach((peerId) => {
-        if (!peerConnections[peerId]) {
+        if (!peerConnections[peerId] && isMasterPeer(peerId)) {
             console.log("Worker initiating connection to", peerId);
             createConnection(peerId);
         }
     });
 
-    // Redraw topology
+    // Redraw topology and refresh health/channel counts (departures above
+    // tear down channels silently, so the counters need a refresh here).
     drawNetwork(latestPeers);
+    updateHealthStatus();
 }
 
 // Render resource allocation summary
@@ -231,13 +371,11 @@ function createConnection(peerId) {
 
     pc.onicecandidate = (event) => {
         if (event.candidate) {
-            ws.send(
-                JSON.stringify({
-                    to: peerId,
-                    type: "candidate",
-                    candidate: event.candidate,
-                }),
-            );
+            safeSend({
+                to: peerId,
+                type: "candidate",
+                candidate: event.candidate,
+            });
         }
     };
 
@@ -252,13 +390,11 @@ function createConnection(peerId) {
             return pc.setLocalDescription(offer);
         })
         .then(() => {
-            ws.send(
-                JSON.stringify({
-                    to: peerId,
-                    type: "offer",
-                    offer: pc.localDescription,
-                }),
-            );
+            safeSend({
+                to: peerId,
+                type: "offer",
+                offer: pc.localDescription,
+            });
         })
         .catch(console.error);
 }
@@ -273,13 +409,11 @@ function handleOffer(data) {
 
     pc.onicecandidate = (event) => {
         if (event.candidate) {
-            ws.send(
-                JSON.stringify({
-                    to: peerId,
-                    type: "candidate",
-                    candidate: event.candidate,
-                }),
-            );
+            safeSend({
+                to: peerId,
+                type: "candidate",
+                candidate: event.candidate,
+            });
         }
     };
 
@@ -295,13 +429,11 @@ function handleOffer(data) {
             return pc.setLocalDescription(answer);
         })
         .then(() => {
-            ws.send(
-                JSON.stringify({
-                    to: peerId,
-                    type: "answer",
-                    answer: pc.localDescription,
-                }),
-            );
+            safeSend({
+                to: peerId,
+                type: "answer",
+                answer: pc.localDescription,
+            });
         })
         .catch(console.error);
 }
@@ -312,14 +444,32 @@ function setupDataChannel(channel, peerId) {
     channel.onopen = () => {
         console.log("Data channel open with", peerId);
         connectedPeers[peerId] = true;
+        if (failedWorkers.has(peerId)) {
+            failedWorkers.delete(peerId);
+            addFaultToleranceEvent("recovery", `Channel re-established with ${peerId}`);
+        }
         updateStatus();
         updateHealthStatus();
     };
 
     channel.onclose = () => {
         console.log("Data channel closed with", peerId);
-        delete connectedPeers[peerId];
-        addFaultToleranceEvent("failure", `Data channel closed with ${peerId}`);
+        addFaultToleranceEvent("info", `Data channel closed with ${peerId}`);
+        teardownPeer(peerId);
+        // A master that is still on signaling gets re-dialed once; if it left,
+        // the peerList diff already released everything.
+        setTimeout(() => {
+            if (latestPeers.includes(peerId) && !peerConnections[peerId] && isMasterPeer(peerId)) {
+                console.log("Re-dialing", peerId, "after channel loss");
+                createConnection(peerId);
+            }
+        }, 2000);
+    };
+
+    channel.onerror = (event) => {
+        console.error("Data channel error with", peerId, event.error || event);
+        addFaultToleranceEvent("failure", `Data channel error with ${peerId}`);
+        failedWorkers.add(peerId);
         updateStatus();
         updateHealthStatus();
     };
@@ -338,7 +488,7 @@ function setupDataChannel(channel, peerId) {
             console.warn("⚠️ Dropped malformed frame from", peerId);
             return;
         }
-        const payload = acceptFrame(frame);
+        const payload = acceptFrame(frame, peerId);
         if (payload === null) return;
         if (frame.ftype === FRAME_TASK) {
             await handleTask(payload, channel);
@@ -435,22 +585,24 @@ function drawNetwork(peers) {
         };
     });
 
-    // Draw connections: interconnect all nodes with lines (undirected)
-    for (let i = 0; i < peers.length; i++) {
-        for (let j = i + 1; j < peers.length; j++) {
-            const a = positions[peers[i]];
-            const b = positions[peers[j]];
-            if (!a || !b) continue;
+    // Draw only real edges: a solid line from this worker to each peer whose
+    // data channel is actually open. No fabricated peer-to-peer mesh.
+    const self = positions[myId];
+    if (self) {
+        peers.forEach((id) => {
+            if (id === myId || !connectedPeers[id]) return;
+            const b = positions[id];
+            if (!b) return;
             const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
-            line.setAttribute("x1", a.x);
-            line.setAttribute("y1", a.y);
+            line.setAttribute("x1", self.x);
+            line.setAttribute("y1", self.y);
             line.setAttribute("x2", b.x);
             line.setAttribute("y2", b.y);
             line.setAttribute("stroke", "#87CEEB");
-            line.setAttribute("stroke-width", "1.5");
-            line.setAttribute("stroke-opacity", "0.35");
+            line.setAttribute("stroke-width", "2");
+            line.setAttribute("stroke-opacity", "0.8");
             networkSvg.appendChild(line);
-        }
+        });
     }
 
     // Draw nodes
@@ -467,6 +619,12 @@ function drawNetwork(peers) {
         circle.setAttribute("fill", isSelf ? "#90EE90" : "#ffffff22");
         circle.setAttribute("stroke", isSelf ? "#32CD32" : "#FFFFFF55");
         circle.setAttribute("stroke-width", isSelf ? "3" : "2");
+
+        // Peers known only via signaling (no open channel) render dashed
+        if (!isSelf && !connectedPeers[id]) {
+            circle.setAttribute("stroke-dasharray", "4 3");
+            circle.setAttribute("fill-opacity", "0.45");
+        }
 
         // Label
         const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
@@ -544,11 +702,13 @@ function decodeFrame(buf) {
 }
 
 // Collect frames until a transfer completes; returns the payload or null.
-function acceptFrame(frame) {
+// peerId lets teardownPeer drop a dead peer's half-received transfers.
+function acceptFrame(frame, peerId) {
     if (frame.total === 0 || frame.seq >= frame.total) return null;
     let t = transfers[frame.transferId];
     if (!t) {
         t = transfers[frame.transferId] = {
+            peerId,
             total: frame.total,
             parts: new Array(frame.total).fill(null),
             received: 0,
@@ -840,7 +1000,7 @@ function updateFaultToleranceEventsDisplay() {
     }
 
     const eventsHTML = faultToleranceEvents.map(event => {
-        const icon = event.type === "failure" ? "❌" : event.type === "reassignment" ? "🔄" : "✅";
+        const icon = event.type === "failure" ? "❌" : event.type === "reassignment" ? "🔄" : event.type === "info" ? "ℹ️" : "✅";
         return `
             <div class="fault-event ${event.type}">
                 <strong>${icon} ${event.timestamp}</strong><br>
@@ -862,60 +1022,42 @@ function updateHealthStatus() {
 
     if (!healthIndicator || !healthStatus) return;
 
-    // Determine health based on connections
-    const hasActiveConnections = Object.keys(connectedPeers).length > 0;
-    const wsConnected = ws.readyState === WebSocket.OPEN;
-    const wsConnecting = ws.readyState === WebSocket.CONNECTING;
+    // Health derives from the connection state machine plus real channel count
+    const channelCount = Object.keys(connectedPeers).length;
+    const openChannelsEl = document.getElementById("openChannels");
 
-    // If we've never connected, we're still in initial state (connecting/healthy)
-    if (!hasEverConnected) {
-        if (wsConnecting) {
+    switch (connState) {
+        case "connecting":
             workerHealth = "connecting";
             healthIndicator.className = "health-indicator connecting";
             healthStatus.textContent = "Connecting";
-            connectionState.textContent = "Connecting...";
+            connectionState.textContent = "Signaling: connecting...";
             connectionState.style.color = "#87CEEB";
-        } else if (wsConnected) {
-            // Just connected for the first time
-            hasEverConnected = true;
+            break;
+        case "online":
             workerHealth = "healthy";
             healthIndicator.className = "health-indicator healthy";
-            healthStatus.textContent = "Healthy";
-            connectionState.textContent = "Connected";
+            healthStatus.textContent = channelCount > 0 ? "Healthy" : "Idle - waiting for master";
+            connectionState.textContent = `Signaling: connected · Channels: ${channelCount}`;
             connectionState.style.color = "#90EE90";
-        } else {
-            // Initial state - not connected yet but haven't failed
-            workerHealth = "healthy";
-            healthIndicator.className = "health-indicator healthy";
-            healthStatus.textContent = "Initializing";
-            connectionState.textContent = "Initializing...";
-            connectionState.style.color = "#87CEEB";
-        }
-    } else {
-        // We've had a connection before, so we can detect failures
-        if (!wsConnected && !hasActiveConnections) {
-            // Lost connection after having one - this is a failure
-            if (workerHealth !== "recovering") {
-                workerHealth = "failed";
-                healthIndicator.className = "health-indicator failed";
-                healthStatus.textContent = "Failed";
-                connectionState.textContent = "Disconnected";
-                connectionState.style.color = "#FF6B6B";
-            }
-        } else if (workerHealth === "recovering") {
+            break;
+        case "reconnecting":
+            workerHealth = "recovering";
             healthIndicator.className = "health-indicator recovering";
-            healthStatus.textContent = "Recovering";
-            connectionState.textContent = "Reconnecting";
+            healthStatus.textContent = `Reconnecting (attempt ${reconnectAttempt})`;
+            connectionState.textContent = "Signaling: down · Channels: 0";
             connectionState.style.color = "#FFD93D";
-        } else {
-            workerHealth = "healthy";
-            healthIndicator.className = "health-indicator healthy";
-            healthStatus.textContent = "Healthy";
-            connectionState.textContent = "Connected";
-            connectionState.style.color = "#90EE90";
-        }
+            break;
+        case "down":
+            workerHealth = "failed";
+            healthIndicator.className = "health-indicator failed";
+            healthStatus.textContent = "Failed (simulated)";
+            connectionState.textContent = "Signaling: closed (simulated failure)";
+            connectionState.style.color = "#FF6B6B";
+            break;
     }
 
+    if (openChannelsEl) openChannelsEl.textContent = channelCount;
     if (tasksCompletedEl) tasksCompletedEl.textContent = tasksCompleted;
     if (tasksFailedEl) tasksFailedEl.textContent = tasksFailed;
 
@@ -925,47 +1067,32 @@ function updateHealthStatus() {
     }
 }
 
+// Kill this worker for real (channels + signaling), stay down for 3s, then
+// rejoin through the normal reconnect path. Every message shown is true: the
+// master genuinely loses this worker and the recovery event only fires once
+// re-registration actually happened.
 function simulateWorkerFailure() {
-    if (workerHealth === "failed") {
-        // Recovery simulation
-        workerHealth = "recovering";
-        addFaultToleranceEvent("recovery", "Worker recovery initiated...");
-
-        setTimeout(() => {
-            workerHealth = "healthy";
-            addFaultToleranceEvent("recovery", "Worker recovered successfully!");
-            updateHealthStatus();
-        }, 2000);
-    } else {
-        // Failure simulation
-        workerHealth = "failed";
-        addFaultToleranceEvent("failure", "Worker failure simulated for demonstration");
-
-        // Close all data channels to simulate failure
-        Object.keys(dataChannels).forEach(peerId => {
-            const channel = dataChannels[peerId];
-            if (channel && channel.readyState === "open") {
-                channel.close();
-            }
-        });
-
-        // Close WebSocket connection
-        if (ws.readyState === WebSocket.OPEN) {
-            ws.close();
-        }
-
-        updateHealthStatus();
-
-        // Show reassignment message after a delay
-        setTimeout(() => {
-            addFaultToleranceEvent("reassignment", "Tasks being reassigned to other workers...");
-        }, 1000);
+    if (connState !== "online") {
+        console.log("Simulate ignored: worker is not online");
+        return;
     }
+    addFaultToleranceEvent("failure", "Simulated failure: closing data channels and signaling connection");
+    intentionalClose = true;
+    ws.close(); // handleWsClose tears down peers and parks us in "down"
+    setTimeout(() => {
+        addFaultToleranceEvent("info", "Simulated outage window over - reconnecting");
+        forceReconnect();
+    }, 3000);
 }
 
-// Initialize health status on load
-if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', updateHealthStatus);
-} else {
+// Initialize on load
+function initWorker() {
     updateHealthStatus();
+    connectSignaling();
+}
+
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initWorker);
+} else {
+    initWorker();
 }

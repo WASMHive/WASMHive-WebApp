@@ -192,6 +192,11 @@
             background: rgba(144, 238, 144, 0.1);
         }
 
+        .fault-event.info {
+            border-left-color: #87CEEB;
+            background: rgba(135, 206, 235, 0.1);
+        }
+
         @keyframes slideIn {
             from {
                 opacity: 0;
@@ -230,7 +235,7 @@
             <p><strong>Worker ID:</strong> <span id="workerId" class="worker-id">Connecting...</span></p>
             <p><strong>WebSocket Status:</strong> <span id="wsStatus" class="status disconnected">Disconnected</span></p>
             <p><strong>Network Peers:</strong> <span id="peerList">None</span></p>
-            <p><strong>Total Peers:</strong> <span id="totalPeers">1</span></p>
+            <p><strong>Total Peers:</strong> <span id="totalPeers">0</span></p>
         </div>
 
 		<div class="info-section">
@@ -259,7 +264,8 @@
                 <span class="health-indicator healthy" id="healthIndicator"></span>
                 <span id="healthStatus">Healthy</span>
             </p>
-            <p><strong>Connection State:</strong> <span id="connectionState">Connected</span></p>
+            <p><strong>Connection State:</strong> <span id="connectionState">Connecting...</span></p>
+            <p><strong>Open Data Channels:</strong> <span id="openChannels">0</span></p>
             <p><strong>Tasks Completed:</strong> <span id="tasksCompleted">0</span></p>
             <p><strong>Tasks Failed:</strong> <span id="tasksFailed">0</span></p>
             <button class="simulate-failure-btn" id="simulateFailureBtn" onclick="simulateWorkerFailure()">
