@@ -6,7 +6,7 @@ let peerConnections = {}; // { peerId: RTCPeerConnection }
 let dataChannels = {}; // { peerId: RTCDataChannel }
 let connectedPeers = {}; // { peerId: true } when data channel is open
 let computeHistory = []; // Store compute task history
-let moduleCache = {}; // { module_hash: Promise<wasm module> } persists across jobs
+let rawModuleCache = {}; // { module_hash: { wasm: Uint8Array, glue: string } } persists across jobs
 let pendingModuleWaits = {}; // { module_hash: { resolve, reject, timer } }
 let latestPeers = []; // Cache latest peer list for redraws
 let latestPeerTypes = null; // { peerId: "master"|"worker"|"unknown" }, absent on old servers
@@ -24,8 +24,15 @@ let announceRecoveryOnWelcome = false;
 let workerHealth = "healthy"; // derived from connState in updateHealthStatus
 let tasksCompleted = 0;
 let tasksFailed = 0;
+let tasksRunning = 0; // tasks currently executing in the exec-worker pool
 let faultToleranceEvents = []; // Store fault tolerance events
 let failedWorkers = new Set(); // Peers whose data channel errored while still listed
+
+// Exec-worker pool: WASM runs here, off the main thread, so the tab and its
+// dashboard stay responsive during compute.
+const EXEC_POOL_SIZE = Math.min(navigator.hardwareConcurrency || 2, 4);
+let execPool = []; // [{ worker, objectUrl, inFlight, loadedHashes: Set }]
+let pendingExecTasks = {}; // { taskId: { header, channel, entry, inputLen } }
 
 // SVG topology elements
 const networkSvg = document.getElementById("networkSvg");
@@ -758,42 +765,184 @@ function parseTaskPayload(bytes) {
     return { header, wasm, glue, input };
 }
 
-// Load separate WASM module and JS glue
-async function loadSeparateWasmModule(wasmBytes, jsGlue) {
+// ===== Exec-worker pool =====
+//
+// WASM runs inside dedicated Web Workers so the main thread stays free to drive
+// WebRTC, the dashboard, and reconnects during compute. This source is a string
+// (the page is served from file://, where a separate .js worker file can't be
+// loaded) turned into a classic Blob worker. It loads the wasm-bindgen glue via
+// a data: URL because blob:null URLs are blocked inside workers on file://.
+//
+// NOTE: keep this code free of backticks and ${...} — it lives in a template
+// literal on the page.
+const EXEC_WORKER_SOURCE = `
+'use strict';
+const modules = {}; // module_hash -> Promise<glue namespace, initialized>
+
+function glueDataUrl(glue) {
+    // UTF-8 safe base64 of the glue text -> data: URL (importable in a worker).
+    const bytes = new TextEncoder().encode(glue);
+    let bin = '';
+    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return 'data:application/javascript;base64,' + btoa(bin);
+}
+
+function loadModule(hash, wasm, glue) {
+    if (modules[hash]) return modules[hash];
+    const p = (async () => {
+        const ns = await import(glueDataUrl(glue));
+        if (typeof ns.default === 'function') await ns.default(wasm);
+        else if (typeof ns.init === 'function') await ns.init(wasm);
+        else throw new Error('module ' + hash.slice(0, 12) + ' has no init export');
+        return ns;
+    })();
+    // Rejection eviction: a failed load must not poison the cache forever, and
+    // the page must be told so it re-sends the bytes next time.
+    p.catch(() => {
+        delete modules[hash];
+        self.postMessage({ kind: 'moduleFailed', hash: hash });
+    });
+    modules[hash] = p;
+    return p;
+}
+
+function toU8(result) {
+    if (result instanceof Uint8Array) return result;
+    if (ArrayBuffer.isView(result)) return new Uint8Array(result.buffer, result.byteOffset, result.byteLength);
+    if (result instanceof ArrayBuffer) return new Uint8Array(result);
+    throw new Error('map function returned ' + typeof result + ', expected bytes');
+}
+
+self.onmessage = async (e) => {
+    const msg = e.data;
+    if (msg.kind !== 'task') return;
     try {
-        console.log("🔧 Loading separate WASM module and JS glue...");
-
-        // Create a blob URL for the JS glue code
-        const jsBlob = new Blob([jsGlue], { type: 'application/javascript' });
-        const jsUrl = URL.createObjectURL(jsBlob);
-
-        // Import the JS module
-        const wasmModule = await import(jsUrl);
-
-        // Initialize the WASM module with the raw bytes
-        // Try different initialization methods based on wasm-bindgen version
-        if (typeof wasmModule.default === 'function') {
-            // Modern wasm-bindgen: default export is the init function
-            await wasmModule.default(wasmBytes);
-        } else if (typeof wasmModule.init === 'function') {
-            // Alternative: init function exists
-            await wasmModule.init(wasmBytes);
-        } else {
-            // Try manual WebAssembly instantiation
-            const wasmWebAssembly = await WebAssembly.instantiate(wasmBytes);
-            // This won't have the JS wrapper functions, so this approach won't work
-            throw new Error("Unable to initialize WASM module - no suitable init method found");
+        if (msg.module) loadModule(msg.module.hash, msg.module.wasm, msg.module.glue);
+        if (!modules[msg.moduleHash]) {
+            throw new Error('module ' + String(msg.moduleHash).slice(0, 12) + ' not loaded in exec worker');
         }
+        const ns = await modules[msg.moduleHash];
+        const fn = ns[msg.mapFunction];
+        if (typeof fn !== 'function') throw new Error('map function ' + msg.mapFunction + ' not found in module');
+        let out = fn(new Uint8Array(msg.input), msg.meta == null ? null : msg.meta);
+        if (out instanceof Promise) out = await out;
+        // .slice() detaches from WASM linear memory before we transfer the buffer.
+        const copy = toU8(out).slice();
+        self.postMessage({ kind: 'result', taskId: msg.taskId, ok: true, bytes: copy.buffer }, [copy.buffer]);
+    } catch (err) {
+        const m = String((err && err.message) || err);
+        const fatal = (typeof WebAssembly !== 'undefined' && err instanceof WebAssembly.RuntimeError)
+            || /unreachable|RuntimeError/i.test(m);
+        self.postMessage({ kind: 'result', taskId: msg.taskId, ok: false, error: m, fatal: fatal });
+    }
+};
+`;
 
-        console.log("✅ Separate WASM module loaded successfully");
-        return wasmModule;
-    } catch (error) {
-        console.error("❌ Failed to load separate WASM module:", error);
-        throw error;
+function spawnExecWorker() {
+    const blob = new Blob([EXEC_WORKER_SOURCE], { type: "application/javascript" });
+    const objectUrl = URL.createObjectURL(blob);
+    const worker = new Worker(objectUrl); // classic worker; data: URL glue import works inside
+    const entry = { worker, objectUrl, inFlight: 0, loadedHashes: new Set() };
+    worker.onmessage = (e) => handleExecMessage(entry, e.data);
+    worker.onerror = (e) => {
+        console.error("❌ Exec worker crashed:", e.message);
+        respawnExecWorker(entry, "exec worker crashed: " + (e.message || "unknown"));
+    };
+    return entry;
+}
+
+// Least-loaded dispatch; grow the pool lazily up to EXEC_POOL_SIZE.
+function pickExecEntry() {
+    if (execPool.length < EXEC_POOL_SIZE) {
+        const entry = spawnExecWorker();
+        execPool.push(entry);
+        return entry;
+    }
+    return execPool.reduce((a, b) => (b.inFlight < a.inFlight ? b : a));
+}
+
+function dispatchToExecWorker(header, channel, input) {
+    const entry = pickExecEntry();
+    const msg = {
+        kind: "task",
+        taskId: header.task_id,
+        moduleHash: header.module_hash,
+        mapFunction: header.map_function,
+        meta: header.meta ?? null,
+        input: input.buffer,
+    };
+    const transfer = [input.buffer]; // detaches our copy; capture length first
+    const inputLen = input.length;
+    if (!entry.loadedHashes.has(header.module_hash)) {
+        const raw = rawModuleCache[header.module_hash];
+        // Structured-clone copy (not transferred): other pool members may need it.
+        msg.module = { hash: header.module_hash, wasm: raw.wasm, glue: raw.glue };
+        entry.loadedHashes.add(header.module_hash); // optimistic; moduleFailed reverts
+    }
+    pendingExecTasks[header.task_id] = { header, channel, entry, inputLen };
+    entry.inFlight++;
+    tasksRunning++;
+    updateHealthStatus();
+    entry.worker.postMessage(msg, transfer);
+}
+
+function handleExecMessage(entry, msg) {
+    if (msg.kind === "moduleFailed") {
+        entry.loadedHashes.delete(msg.hash); // force a re-send on the next task
+        return;
+    }
+    if (msg.kind !== "result") return;
+    const pending = pendingExecTasks[msg.taskId];
+    if (!pending) return; // already resolved (e.g. by a respawn)
+    delete pendingExecTasks[msg.taskId];
+    entry.inFlight = Math.max(0, entry.inFlight - 1);
+    tasksRunning = Math.max(0, tasksRunning - 1);
+
+    const { header, channel, inputLen } = pending;
+    if (msg.ok) {
+        const result = new Uint8Array(msg.bytes);
+        tasksCompleted++;
+        updateHealthStatus();
+        addToComputeHistory({
+            taskId: header.task_id,
+            dataChunk: [inputLen],
+            result: [result.length],
+            mode: header.map_function,
+            communication: "binary WebRTC",
+        });
+        sendResultFrame(channel, header, result);
+    } else {
+        tasksFailed++;
+        addFaultToleranceEvent("failure", `Task ${header.task_id} failed: ${msg.error}`);
+        updateHealthStatus();
+        sendErrorResultFrame(channel, header, msg.error);
+        // A fatal wasm trap leaves the worker's instances unreliable; respawn it.
+        if (msg.fatal) respawnExecWorker(entry, "exec worker hit a wasm trap");
     }
 }
 
-// ===== Module cache (content-hash keyed, pulled from the master on demand) =====
+// Replace a dead/poisoned exec worker; fail its in-flight tasks back to the
+// master (which reassigns them) so nothing hangs.
+function respawnExecWorker(entry, reason) {
+    const idx = execPool.indexOf(entry);
+    if (idx === -1) return; // already handled
+    execPool.splice(idx, 1);
+    for (const taskId of Object.keys(pendingExecTasks)) {
+        const p = pendingExecTasks[taskId];
+        if (p.entry !== entry) continue;
+        delete pendingExecTasks[taskId];
+        tasksRunning = Math.max(0, tasksRunning - 1);
+        tasksFailed++;
+        addFaultToleranceEvent("failure", `Task ${p.header.task_id} lost (exec worker crashed), retrying`);
+        sendErrorResultFrame(p.channel, p.header, reason);
+    }
+    try { entry.worker.terminate(); } catch (e) { /* already gone */ }
+    try { URL.revokeObjectURL(entry.objectUrl); } catch (e) { /* already revoked */ }
+    updateHealthStatus();
+    // A fresh worker spawns lazily on the next pickExecEntry (pool now under cap).
+}
+
+// ===== Module cache (raw bytes, content-hash keyed, pulled from the master) =====
 
 // Module payload: [u32 hash_len][hash][u32 wasm_len][wasm][u32 glue_len][glue]
 function handleModulePayload(bytes) {
@@ -812,35 +961,32 @@ function handleModulePayload(bytes) {
     const glue = new TextDecoder().decode(bytes.subarray(pos, pos + glueLen));
 
     console.log(`📦 Module ${hash.slice(0, 12)} received (${wasm.length} bytes)`);
-    const loading = loadSeparateWasmModule(wasm, glue);
+    rawModuleCache[hash] = { wasm, glue };
     const wait = pendingModuleWaits[hash];
     if (wait) {
         clearTimeout(wait.timer);
         delete pendingModuleWaits[hash];
-        loading.then(wait.resolve, wait.reject);
-    } else {
-        moduleCache[hash] = loading; // unsolicited but welcome
+        wait.resolve(rawModuleCache[hash]);
     }
 }
 
-// Resolve a module by content hash, requesting it from the master if this
-// worker has never seen it. The cache survives across jobs, so repeat jobs
-// with an unchanged module transfer nothing.
-function ensureModule(channel, moduleHash) {
-    let promise = moduleCache[moduleHash];
-    if (promise) return promise;
+// Resolve a module's raw bytes by content hash, requesting it from the master if
+// unseen. The cache survives across jobs and reconnects (content-addressed), so
+// repeat jobs with an unchanged module transfer nothing.
+function ensureRawModule(channel, moduleHash) {
+    if (rawModuleCache[moduleHash]) return Promise.resolve(rawModuleCache[moduleHash]);
+    const existing = pendingModuleWaits[moduleHash];
+    if (existing) return existing.promise; // dedup concurrent tasks needing the same module
 
-    promise = new Promise((resolve, reject) => {
-        const timer = setTimeout(() => {
-            if (pendingModuleWaits[moduleHash]) {
-                delete pendingModuleWaits[moduleHash];
-                delete moduleCache[moduleHash];
-                reject(new Error(`module ${moduleHash.slice(0, 12)} did not arrive within 30s`));
-            }
-        }, 30000);
-        pendingModuleWaits[moduleHash] = { resolve, reject, timer };
-    });
-    moduleCache[moduleHash] = promise;
+    let resolve, reject;
+    const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+    const timer = setTimeout(() => {
+        if (pendingModuleWaits[moduleHash]) {
+            delete pendingModuleWaits[moduleHash];
+            reject(new Error(`module ${moduleHash.slice(0, 12)} did not arrive within 30s`));
+        }
+    }, 30000);
+    pendingModuleWaits[moduleHash] = { resolve, reject, timer, promise };
 
     console.log(`📡 Requesting module ${moduleHash.slice(0, 12)} from master`);
     const request = new TextEncoder().encode(
@@ -853,16 +999,6 @@ function ensureModule(channel, moduleHash) {
 }
 
 // ===== Task execution =====
-
-// Coerce whatever a map function returned into a Uint8Array.
-function coerceToU8(result) {
-    if (result instanceof Uint8Array) return result;
-    if (ArrayBuffer.isView(result)) {
-        return new Uint8Array(result.buffer, result.byteOffset, result.byteLength);
-    }
-    if (result instanceof ArrayBuffer) return new Uint8Array(result);
-    throw new Error("map function returned " + typeof result + ", expected bytes");
-}
 
 // Result payload: [u32 header_len][header json][body bytes]
 function buildResultPayload(header, body) {
@@ -887,9 +1023,38 @@ async function sendPayloadFrames(channel, ftype, transferId, payload) {
     }
 }
 
-// Execute one task: load/reuse the job's WASM module, call the named map
-// function with (bytes, meta), send the returned bytes back. Any failure is
-// reported to the master as an error result so the task can be reassigned.
+// worker_id must be a string (the master's ResultHeader isn't Option); myId can
+// be null if a reconnect reset the id while a task was still computing.
+function sendResultFrame(channel, header, bytes) {
+    const payload = buildResultPayload(
+        { task_id: header.task_id, chunk_index: header.chunk_index, worker_id: myId || "unknown", meta: header.meta ?? null },
+        bytes
+    );
+    sendPayloadFrames(channel, FRAME_RESULT, header.task_id, payload)
+        .then(() => console.log(`✅ Result for ${header.task_id} sent (${bytes.length} bytes)`))
+        .catch((e) => console.error("❌ Could not send result (channel gone?):", e));
+}
+
+function sendErrorResultFrame(channel, header, errMsg) {
+    const payload = buildResultPayload(
+        {
+            task_id: header.task_id,
+            chunk_index: header.chunk_index,
+            worker_id: myId || "unknown",
+            error: String(errMsg),
+            meta: header.meta ?? null,
+        },
+        new Uint8Array(0)
+    );
+    sendPayloadFrames(channel, FRAME_RESULT, header.task_id, payload).catch((e) =>
+        console.error("❌ Could not report task failure:", e)
+    );
+}
+
+// Parse a task, make sure its module bytes are on hand, and hand it to the exec
+// pool. Returns as soon as it is dispatched, so the channel keeps draining
+// frames while compute runs off-thread. Results/errors are finished in
+// handleExecMessage. Setup failures are reported so the master reassigns.
 async function handleTask(payloadBytes, channel) {
     let header = null;
     try {
@@ -902,71 +1067,19 @@ async function handleTask(payloadBytes, channel) {
 
         // Tasks reference their module by content hash; inline module bytes
         // are accepted too (future small-module optimization).
-        if (task.wasm.length > 0 && !moduleCache[header.module_hash]) {
-            moduleCache[header.module_hash] = loadSeparateWasmModule(task.wasm, task.glue);
+        if (task.wasm.length > 0 && !rawModuleCache[header.module_hash]) {
+            rawModuleCache[header.module_hash] = { wasm: task.wasm, glue: task.glue };
         }
-        const wasmModule = await ensureModule(channel, header.module_hash);
-
-        const mapFn = wasmModule[header.map_function];
-        if (typeof mapFn !== "function") {
-            throw new Error(`map function ${header.map_function} not found in module`);
-        }
-
-        let result = mapFn(task.input, header.meta ?? null);
-        if (result instanceof Promise) result = await result;
-        result = coerceToU8(result);
-
-        tasksCompleted++;
-        updateHealthStatus();
-        addToComputeHistory({
-            taskId: header.task_id,
-            dataChunk: [task.input.length],
-            result: [result.length],
-            mode: header.map_function,
-            communication: "binary WebRTC",
-        });
-
-        await sendPayloadFrames(
-            channel,
-            FRAME_RESULT,
-            header.task_id,
-            buildResultPayload(
-                {
-                    task_id: header.task_id,
-                    chunk_index: header.chunk_index,
-                    worker_id: myId,
-                    meta: header.meta ?? null,
-                },
-                result
-            )
-        );
-        console.log(`✅ Result for ${header.task_id} sent (${result.length} bytes)`);
+        await ensureRawModule(channel, header.module_hash);
+        dispatchToExecWorker(header, channel, task.input);
     } catch (error) {
-        console.error("❌ Task failed:", error);
+        console.error("❌ Task setup failed:", error);
         tasksFailed++;
-        addFaultToleranceEvent("failure", `Task ${header ? header.task_id : "?"} failed: ${error.message}`);
-        updateHealthStatus();
         if (header) {
-            try {
-                await sendPayloadFrames(
-                    channel,
-                    FRAME_RESULT,
-                    header.task_id,
-                    buildResultPayload(
-                        {
-                            task_id: header.task_id,
-                            chunk_index: header.chunk_index,
-                            worker_id: myId,
-                            error: String(error.message || error),
-                            meta: header.meta ?? null,
-                        },
-                        new Uint8Array(0)
-                    )
-                );
-            } catch (sendError) {
-                console.error("❌ Could not report task failure:", sendError);
-            }
+            addFaultToleranceEvent("failure", `Task ${header.task_id} failed: ${error.message}`);
+            sendErrorResultFrame(channel, header, String(error.message || error));
         }
+        updateHealthStatus();
     }
 }
 
@@ -1019,6 +1132,7 @@ function updateHealthStatus() {
     const connectionState = document.getElementById("connectionState");
     const tasksCompletedEl = document.getElementById("tasksCompleted");
     const tasksFailedEl = document.getElementById("tasksFailed");
+    const tasksRunningEl = document.getElementById("tasksRunning");
 
     if (!healthIndicator || !healthStatus) return;
 
@@ -1060,6 +1174,7 @@ function updateHealthStatus() {
     if (openChannelsEl) openChannelsEl.textContent = channelCount;
     if (tasksCompletedEl) tasksCompletedEl.textContent = tasksCompleted;
     if (tasksFailedEl) tasksFailedEl.textContent = tasksFailed;
+    if (tasksRunningEl) tasksRunningEl.textContent = tasksRunning;
 
     // Redraw network to show health status
     if (latestPeers && latestPeers.length > 0) {
