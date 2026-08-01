@@ -5,280 +5,486 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>WASMHive Worker Node</title>
     <style>
+        :root {
+            --bg: #100e0a;
+            --bg-2: #16130d;
+            --panel: #1b1710;
+            --panel-2: #221c13;
+            --line: rgba(246, 183, 60, 0.16);
+            --line-soft: rgba(255, 255, 255, 0.06);
+            --honey: #f6b73c;
+            --honey-bright: #ffd27a;
+            --honey-dim: #b6883092;
+            --ink: #ece4d2;
+            --muted: #9c927c;
+            --ok: #86e0a0;
+            --fail: #ff6b6b;
+            --warn: #ffd93d;
+            --info: #8fd0ee;
+            --mono: "SF Mono", "JetBrains Mono", "Fira Code", Menlo, Consolas, "Liberation Mono", monospace;
+        }
+
+        * { box-sizing: border-box; }
+
+        html, body { margin: 0; padding: 0; }
+
         body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            max-width: 800px;
-            margin: 0 auto;
-            padding: 20px;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
+            font-family: var(--mono);
+            color: var(--ink);
+            background:
+                radial-gradient(1100px 500px at 78% -10%, rgba(246, 183, 60, 0.10), transparent 60%),
+                radial-gradient(900px 600px at -10% 110%, rgba(246, 183, 60, 0.05), transparent 55%),
+                var(--bg);
             min-height: 100vh;
-        }
-
-        .container {
-            background: rgba(255, 255, 255, 0.1);
-            backdrop-filter: blur(10px);
-            border-radius: 15px;
-            padding: 30px;
-            box-shadow: 0 8px 32px 0 rgba(31, 38, 135, 0.37);
-            border: 1px solid rgba(255, 255, 255, 0.18);
-        }
-
-        h1 {
-            text-align: center;
-            margin-bottom: 30px;
-            text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.3);
-        }
-
-        .info-section {
-            background: rgba(255, 255, 255, 0.05);
-            border-radius: 10px;
-            padding: 20px;
-            margin: 20px 0;
-            border: 1px solid rgba(255, 255, 255, 0.1);
-        }
-
-        .info-section h3 {
-            margin-top: 0;
-            color: #87CEEB;
-        }
-
-        .status {
-            padding: 10px 15px;
-            border-radius: 8px;
-            font-weight: bold;
-            margin: 10px 0;
-        }
-
-        .status.connected {
-            background: rgba(0, 255, 0, 0.2);
-            border: 1px solid rgba(0, 255, 0, 0.5);
-        }
-
-        .status.disconnected {
-            background: rgba(255, 0, 0, 0.2);
-            border: 1px solid rgba(255, 0, 0, 0.5);
-        }
-
-        .history-display {
-            background: rgba(255, 255, 255, 0.08);
-            border-radius: 8px;
-            padding: 15px;
-            margin: 10px 0;
-            font-family: 'Courier New', monospace;
             font-size: 14px;
-            max-height: 300px;
-            overflow-y: auto;
-            border: 1px solid rgba(255, 255, 255, 0.2);
+            line-height: 1.5;
+            -webkit-font-smoothing: antialiased;
         }
+
+        /* Faint honeycomb wash behind everything */
+        body::before {
+            content: "";
+            position: fixed;
+            inset: 0;
+            z-index: 0;
+            pointer-events: none;
+            opacity: 0.5;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='48' height='28' viewBox='0 0 48 28'%3E%3Cpath d='M12 1 L24 1 L30 7 M24 1 L24 -6 M0 7 L6 1 L12 1 M0 7 L0 14 L6 20 L12 14 L12 7 M12 14 L18 20 L18 27 M6 20 L6 27 M18 20 L24 14 L30 20 L24 27 M24 14 L24 7 L30 7 L36 1 L48 1 M30 7 L30 20 L36 27 M30 20 L36 14 L48 14 M36 14 L36 1' fill='none' stroke='%23f6b73c' stroke-opacity='0.05' stroke-width='1'/%3E%3C/svg%3E");
+            background-size: 48px 28px;
+        }
+
+        .shell {
+            position: relative;
+            z-index: 1;
+            max-width: 1120px;
+            margin: 0 auto;
+            padding: 28px 22px 56px;
+        }
+
+        /* ===== Masthead ===== */
+        .masthead {
+            display: flex;
+            align-items: flex-end;
+            justify-content: space-between;
+            gap: 20px;
+            flex-wrap: wrap;
+            padding-bottom: 18px;
+            border-bottom: 1px solid var(--line);
+            margin-bottom: 22px;
+        }
+        .brand { display: flex; align-items: center; gap: 14px; }
+        .brand .mark {
+            font-size: 30px;
+            line-height: 1;
+            filter: drop-shadow(0 0 10px rgba(246, 183, 60, 0.35));
+        }
+        .brand h1 {
+            margin: 0;
+            font-size: 22px;
+            letter-spacing: 0.42em;
+            font-weight: 700;
+            color: var(--honey-bright);
+            text-shadow: 0 0 18px rgba(246, 183, 60, 0.25);
+        }
+        .brand .sub {
+            margin-top: 3px;
+            font-size: 11px;
+            letter-spacing: 0.34em;
+            color: var(--muted);
+            text-transform: uppercase;
+        }
+
+        .join {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            min-width: 300px;
+            flex: 1 1 300px;
+            max-width: 460px;
+        }
+        .join .join-label {
+            font-size: 10px;
+            letter-spacing: 0.28em;
+            text-transform: uppercase;
+            color: var(--muted);
+            display: flex;
+            justify-content: space-between;
+        }
+        .join .join-label b { color: var(--honey); font-weight: 600; letter-spacing: 0.1em; }
+        .join-row { display: flex; gap: 8px; }
+        #joinLink {
+            flex: 1;
+            background: var(--bg-2);
+            border: 1px solid var(--line);
+            color: var(--ink);
+            font-family: var(--mono);
+            font-size: 12px;
+            padding: 9px 11px;
+            border-radius: 7px;
+            outline: none;
+        }
+        #joinLink:focus { border-color: var(--honey); }
+        .btn {
+            font-family: var(--mono);
+            font-size: 11px;
+            letter-spacing: 0.14em;
+            text-transform: uppercase;
+            cursor: pointer;
+            border-radius: 7px;
+            border: 1px solid var(--line);
+            background: linear-gradient(180deg, var(--panel-2), var(--panel));
+            color: var(--honey);
+            padding: 9px 14px;
+            transition: all 0.16s ease;
+            white-space: nowrap;
+        }
+        .btn:hover { border-color: var(--honey); color: var(--honey-bright); box-shadow: 0 0 14px rgba(246, 183, 60, 0.18); }
+        .btn:active { transform: translateY(1px); }
+
+        /* ===== Grid ===== */
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(12, 1fr);
+            gap: 16px;
+        }
+        .panel {
+            position: relative;
+            background: linear-gradient(180deg, rgba(255, 255, 255, 0.015), transparent), var(--panel);
+            border: 1px solid var(--line-soft);
+            border-radius: 12px;
+            padding: 16px 18px;
+            animation: rise 0.5s cubic-bezier(0.2, 0.7, 0.2, 1) both;
+        }
+        .panel::after {
+            content: "";
+            position: absolute;
+            left: 16px; right: 16px; top: 0;
+            height: 1px;
+            background: linear-gradient(90deg, transparent, var(--honey-dim), transparent);
+            opacity: 0.5;
+        }
+        .col-4 { grid-column: span 4; }
+        .col-5 { grid-column: span 5; }
+        .col-6 { grid-column: span 6; }
+        .col-7 { grid-column: span 7; }
+        .col-8 { grid-column: span 8; }
+        .col-12 { grid-column: span 12; }
+
+        .panel h3 {
+            margin: 0 0 14px;
+            font-size: 11px;
+            letter-spacing: 0.26em;
+            text-transform: uppercase;
+            color: var(--muted);
+            display: flex;
+            align-items: center;
+            gap: 9px;
+        }
+        .panel h3::before {
+            content: "";
+            width: 9px; height: 10px;
+            background: var(--honey);
+            clip-path: polygon(50% 0, 100% 25%, 100% 75%, 50% 100%, 0 75%, 0 25%);
+            opacity: 0.8;
+            flex: none;
+        }
+
+        .kv { display: flex; flex-direction: column; gap: 9px; }
+        .kv .row { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+        .kv .k { color: var(--muted); font-size: 12px; }
+        .kv .v { color: var(--ink); text-align: right; word-break: break-all; }
+        .worker-id { color: var(--honey-bright); }
+
+        /* status chip */
+        .status {
+            display: inline-block;
+            padding: 3px 10px;
+            border-radius: 999px;
+            font-size: 11px;
+            letter-spacing: 0.08em;
+            border: 1px solid var(--line);
+        }
+        .status.connected { color: var(--ok); border-color: rgba(134, 224, 160, 0.4); background: rgba(134, 224, 160, 0.08); }
+        .status.disconnected { color: var(--fail); border-color: rgba(255, 107, 107, 0.4); background: rgba(255, 107, 107, 0.08); }
+
+        /* ===== Telemetry tiles ===== */
+        .tiles {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 12px;
+        }
+        .tile {
+            position: relative;
+            background: var(--bg-2);
+            border: 1px solid var(--line-soft);
+            padding: 13px 14px 12px;
+            border-radius: 9px;
+            clip-path: polygon(0 0, calc(100% - 11px) 0, 100% 11px, 100% 100%, 11px 100%, 0 calc(100% - 11px));
+        }
+        .tile .tl {
+            font-size: 10px;
+            letter-spacing: 0.2em;
+            text-transform: uppercase;
+            color: var(--muted);
+        }
+        .tile .tv {
+            margin-top: 6px;
+            font-size: 26px;
+            font-weight: 600;
+            color: var(--honey-bright);
+            line-height: 1.05;
+            font-variant-numeric: tabular-nums;
+        }
+        .tile .tu { font-size: 12px; color: var(--muted); margin-left: 2px; }
+        .tile.live .tv { color: var(--honey); }
+        .tile.live::before {
+            content: "";
+            position: absolute;
+            top: 12px; right: 12px;
+            width: 7px; height: 7px;
+            border-radius: 50%;
+            background: var(--honey);
+            box-shadow: 0 0 0 0 rgba(246, 183, 60, 0.6);
+            animation: ping 1.4s ease-out infinite;
+        }
+        .tile.small .tv { font-size: 19px; color: var(--ink); }
+        .tile.small .tv.ok { color: var(--ok); }
+        .tile.small .tv.fail { color: var(--fail); }
+
+        /* ===== Topology ===== */
+        #networkSvg {
+            width: 100%;
+            height: 340px;
+            background:
+                radial-gradient(400px 240px at 50% 45%, rgba(246, 183, 60, 0.05), transparent 70%),
+                var(--bg-2);
+            border-radius: 10px;
+            border: 1px solid var(--line-soft);
+            display: block;
+        }
+        .legend { display: flex; gap: 16px; margin-top: 11px; flex-wrap: wrap; font-size: 11px; color: var(--muted); }
+        .legend span { display: inline-flex; align-items: center; gap: 6px; }
+        .legend i { width: 10px; height: 11px; clip-path: polygon(50% 0, 100% 25%, 100% 75%, 50% 100%, 0 75%, 0 25%); flex: none; }
+        .legend .self { background: var(--honey); }
+        .legend .conn { background: transparent; border: 1px solid var(--ok); }
+        .legend .idle { background: transparent; border: 1px dashed var(--muted); }
+
+        /* ===== Health ===== */
+        .health-line { display: flex; align-items: center; gap: 11px; margin-bottom: 14px; }
+        .health-indicator {
+            width: 16px; height: 18px;
+            clip-path: polygon(50% 0, 100% 25%, 100% 75%, 50% 100%, 0 75%, 0 25%);
+            flex: none;
+            background: var(--muted);
+            animation: breathe 2.4s ease-in-out infinite;
+        }
+        .health-indicator.healthy { background: var(--ok); box-shadow: 0 0 12px rgba(134, 224, 160, 0.5); }
+        .health-indicator.connecting { background: var(--info); box-shadow: 0 0 12px rgba(143, 208, 238, 0.5); }
+        .health-indicator.recovering { background: var(--warn); box-shadow: 0 0 12px rgba(255, 217, 61, 0.5); }
+        .health-indicator.failed { background: var(--fail); box-shadow: 0 0 12px rgba(255, 107, 107, 0.6); animation: blink 1s steps(2) infinite; }
+        #healthStatus { font-size: 15px; color: var(--ink); }
+        #connectionState { color: var(--muted); font-size: 12px; }
+
+        .sim-btn {
+            margin-top: 16px;
+            width: 100%;
+            font-family: var(--mono);
+            font-size: 11px;
+            letter-spacing: 0.16em;
+            text-transform: uppercase;
+            cursor: pointer;
+            border-radius: 8px;
+            border: 1px solid rgba(255, 107, 107, 0.35);
+            background: rgba(255, 107, 107, 0.06);
+            color: var(--fail);
+            padding: 11px;
+            transition: all 0.16s ease;
+        }
+        .sim-btn:hover { background: rgba(255, 107, 107, 0.14); border-color: var(--fail); box-shadow: 0 0 14px rgba(255, 107, 107, 0.18); }
+        .sim-btn:active { transform: translateY(1px); }
+
+        /* ===== Scroll panes (history / events) ===== */
+        .pane { max-height: 300px; overflow-y: auto; padding-right: 4px; }
+        .pane::-webkit-scrollbar { width: 8px; }
+        .pane::-webkit-scrollbar-track { background: transparent; }
+        .pane::-webkit-scrollbar-thumb { background: var(--honey-dim); border-radius: 4px; }
+
+        .history-message { color: var(--muted); font-style: normal; font-size: 12px; padding: 8px 2px; opacity: 0.8; }
 
         .history-item {
-            background: rgba(255, 255, 255, 0.05);
-            border-radius: 6px;
-            padding: 12px;
-            margin: 8px 0;
-            border-left: 3px solid #87CEEB;
-            transition: background 0.3s ease;
-        }
-
-        .history-item:hover {
-            background: rgba(255, 255, 255, 0.1);
-        }
-
-        .history-item.latest {
-            border-left-color: #90EE90;
-            background: rgba(144, 238, 144, 0.1);
-        }
-
-        .history-timestamp {
-            color: #87CEEB;
+            background: var(--bg-2);
+            border: 1px solid var(--line-soft);
+            border-left: 2px solid var(--honey-dim);
+            border-radius: 7px;
+            padding: 10px 12px;
+            margin-bottom: 9px;
             font-size: 12px;
-            margin-bottom: 5px;
+            word-break: break-word;
         }
-
-        .history-message {
-            text-align: center;
-            color: rgba(255, 255, 255, 0.6);
-            padding: 20px;
-            font-style: italic;
+        .history-item.latest {
+            border-left-color: var(--honey);
+            box-shadow: 0 0 0 1px rgba(246, 183, 60, 0.12);
+            animation: flashIn 0.5s ease;
         }
-
-        .worker-id {
-            font-family: 'Courier New', monospace;
-            background: rgba(255, 255, 255, 0.1);
-            padding: 5px 10px;
-            border-radius: 5px;
-            display: inline-block;
-        }
-
-        .instruction {
-            background: rgba(255, 255, 255, 0.05);
-            padding: 15px;
-            border-radius: 8px;
-            margin: 20px 0;
-            border-left: 4px solid #87CEEB;
-        }
-
-        .fault-tolerance-status {
-            background: rgba(255, 255, 255, 0.05);
-            border-radius: 10px;
-            padding: 20px;
-            margin: 20px 0;
-            border: 1px solid rgba(255, 255, 255, 0.1);
-        }
-
-        .health-indicator {
-            display: inline-block;
-            width: 12px;
-            height: 12px;
-            border-radius: 50%;
-            margin-right: 8px;
-            animation: pulse 2s infinite;
-        }
-
-        .health-indicator.healthy {
-            background: #90EE90;
-            box-shadow: 0 0 10px rgba(144, 238, 144, 0.5);
-        }
-
-        .health-indicator.failed {
-            background: #FF6B6B;
-            box-shadow: 0 0 10px rgba(255, 107, 107, 0.5);
-            animation: blink 1s infinite;
-        }
-
-        .health-indicator.recovering {
-            background: #FFD93D;
-            box-shadow: 0 0 10px rgba(255, 217, 61, 0.5);
-        }
-
-        .health-indicator.connecting {
-            background: #87CEEB;
-            box-shadow: 0 0 10px rgba(135, 206, 235, 0.5);
-        }
-
-        @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.6; }
-        }
-
-        @keyframes blink {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.3; }
-        }
+        .history-item strong { color: var(--muted); font-weight: 500; }
+        .history-timestamp { color: var(--honey); font-size: 10.5px; letter-spacing: 0.06em; margin-bottom: 6px; opacity: 0.85; }
 
         .fault-event {
-            background: rgba(255, 255, 255, 0.05);
-            border-radius: 6px;
-            padding: 10px;
-            margin: 8px 0;
-            border-left: 3px solid;
-            font-size: 13px;
+            background: var(--bg-2);
+            border-left: 3px solid var(--muted);
+            border-radius: 7px;
+            padding: 9px 12px;
+            margin-bottom: 8px;
+            font-size: 12px;
             animation: slideIn 0.3s ease;
         }
+        .fault-event strong { font-weight: 600; }
+        .fault-event.failure { border-left-color: var(--fail); background: rgba(255, 107, 107, 0.07); }
+        .fault-event.reassignment { border-left-color: var(--warn); background: rgba(255, 217, 61, 0.07); }
+        .fault-event.recovery { border-left-color: var(--ok); background: rgba(134, 224, 160, 0.07); }
+        .fault-event.info { border-left-color: var(--info); background: rgba(143, 208, 238, 0.07); }
 
-        .fault-event.failure {
-            border-left-color: #FF6B6B;
-            background: rgba(255, 107, 107, 0.1);
+        /* ===== Animations ===== */
+        @keyframes rise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+        @keyframes flashIn { from { background: rgba(246, 183, 60, 0.16); } to { background: var(--bg-2); } }
+        @keyframes slideIn { from { opacity: 0; transform: translateX(-8px); } to { opacity: 1; transform: none; } }
+        @keyframes breathe { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
+        @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+        @keyframes ping {
+            0% { box-shadow: 0 0 0 0 rgba(246, 183, 60, 0.55); }
+            70% { box-shadow: 0 0 0 9px rgba(246, 183, 60, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(246, 183, 60, 0); }
         }
+        .panel:nth-child(1) { animation-delay: 0.02s; }
+        .panel:nth-child(2) { animation-delay: 0.06s; }
+        .panel:nth-child(3) { animation-delay: 0.10s; }
+        .panel:nth-child(4) { animation-delay: 0.14s; }
+        .panel:nth-child(5) { animation-delay: 0.18s; }
+        .panel:nth-child(6) { animation-delay: 0.22s; }
 
-        .fault-event.reassignment {
-            border-left-color: #FFD93D;
-            background: rgba(255, 217, 61, 0.1);
-        }
-
-        .fault-event.recovery {
-            border-left-color: #90EE90;
-            background: rgba(144, 238, 144, 0.1);
-        }
-
-        .fault-event.info {
-            border-left-color: #87CEEB;
-            background: rgba(135, 206, 235, 0.1);
-        }
-
-        @keyframes slideIn {
-            from {
-                opacity: 0;
-                transform: translateX(-10px);
-            }
-            to {
-                opacity: 1;
-                transform: translateX(0);
-            }
-        }
-
-        .simulate-failure-btn {
-            background: rgba(255, 107, 107, 0.3);
-            border: 1px solid rgba(255, 107, 107, 0.5);
-            color: white;
-            padding: 10px 20px;
-            border-radius: 8px;
-            cursor: pointer;
-            font-weight: bold;
-            margin-top: 10px;
-            transition: all 0.3s ease;
-        }
-
-        .simulate-failure-btn:hover {
-            background: rgba(255, 107, 107, 0.5);
-            transform: scale(1.05);
+        @media (max-width: 860px) {
+            .col-4, .col-5, .col-6, .col-7, .col-8 { grid-column: span 12; }
+            .brand h1 { font-size: 18px; letter-spacing: 0.3em; }
         }
     </style>
 </head>
 <body>
-    <div class="container">
-        <h1>🐝 WASMHive Worker Node</h1>
-
-        <div class="info-section">
-            <h3>Worker Information</h3>
-            <p><strong>Worker ID:</strong> <span id="workerId" class="worker-id">Connecting...</span></p>
-            <p><strong>WebSocket Status:</strong> <span id="wsStatus" class="status disconnected">Disconnected</span></p>
-            <p><strong>Network Peers:</strong> <span id="peerList">None</span></p>
-            <p><strong>Total Peers:</strong> <span id="totalPeers">0</span></p>
-        </div>
-
-		<div class="info-section">
-			<h3>Network Topology</h3>
-			<svg id="networkSvg" width="100%" height="320" style="background: rgba(255, 255, 255, 0.05); border-radius: 10px; border: 1px solid rgba(255, 255, 255, 0.1);"></svg>
-		</div>
-
-        <div class="info-section">
-            <h3>Compute History</h3>
-            <div id="computeHistory" class="history-display">
-                <div class="history-message">No compute tasks received yet...</div>
+    <div class="shell">
+        <header class="masthead">
+            <div class="brand">
+                <span class="mark">🐝</span>
+                <div>
+                    <h1>WASMHIVE</h1>
+                    <div class="sub">Worker Node &middot; Volunteer Compute</div>
+                </div>
             </div>
-        </div>
-
-        <div class="info-section">
-            <h3>Resource Allocation</h3>
-            <div id="allocationSummary" class="history-display">
-                <div class="history-message">Waiting for allocation data...</div>
+            <div class="join">
+                <div class="join-label">
+                    <span>Join link &mdash; share to add a worker</span>
+                    <b id="serverLabel">&mdash;</b>
+                </div>
+                <div class="join-row">
+                    <input id="joinLink" type="text" readonly value="loading&hellip;" onclick="this.select()">
+                    <button class="btn" id="copyLinkBtn" onclick="copyJoinLink()">Copy</button>
+                </div>
             </div>
-        </div>
+        </header>
 
-        <div class="info-section fault-tolerance-status">
-            <h3>🛡️ Fault Tolerance Status</h3>
-            <p>
-                <strong>Worker Health:</strong> 
-                <span class="health-indicator healthy" id="healthIndicator"></span>
-                <span id="healthStatus">Healthy</span>
-            </p>
-            <p><strong>Connection State:</strong> <span id="connectionState">Connecting...</span></p>
-            <p><strong>Open Data Channels:</strong> <span id="openChannels">0</span></p>
-            <p><strong>Tasks Running:</strong> <span id="tasksRunning">0</span></p>
-            <p><strong>Tasks Completed:</strong> <span id="tasksCompleted">0</span></p>
-            <p><strong>Tasks Failed:</strong> <span id="tasksFailed">0</span></p>
-            <button class="simulate-failure-btn" id="simulateFailureBtn" onclick="simulateWorkerFailure()">
-                🧪 Simulate Worker Failure (Demo)
-            </button>
-        </div>
+        <div class="grid">
+            <!-- Identity -->
+            <section class="panel col-5">
+                <h3>Node Identity</h3>
+                <div class="kv">
+                    <div class="row"><span class="k">Worker ID</span><span class="v worker-id" id="workerId">Connecting&hellip;</span></div>
+                    <div class="row"><span class="k">Signaling</span><span class="v"><span id="wsStatus" class="status disconnected">Disconnected</span></span></div>
+                    <div class="row"><span class="k">Network peers</span><span class="v" id="peerList">None</span></div>
+                    <div class="row"><span class="k">Total peers</span><span class="v" id="totalPeers">0</span></div>
+                </div>
+            </section>
 
-        <div class="info-section">
-            <h3>⚡ Fault Tolerance Events</h3>
-            <div id="faultToleranceEvents" class="history-display" style="max-height: 200px;">
-                <div class="history-message">No fault tolerance events yet...</div>
-            </div>
+            <!-- Telemetry -->
+            <section class="panel col-7">
+                <h3>Compute Telemetry</h3>
+                <div class="tiles">
+                    <div class="tile" id="runningTile">
+                        <div class="tl">Running</div>
+                        <div class="tv"><span id="tasksRunning">0</span></div>
+                    </div>
+                    <div class="tile">
+                        <div class="tl">Throughput</div>
+                        <div class="tv"><span id="throughput">0.0</span><span class="tu">/s</span></div>
+                    </div>
+                    <div class="tile">
+                        <div class="tl">Exec pool</div>
+                        <div class="tv" id="poolStatus" style="font-size:16px;">idle</div>
+                    </div>
+                    <div class="tile small">
+                        <div class="tl">Completed</div>
+                        <div class="tv ok" id="tasksCompleted">0</div>
+                    </div>
+                    <div class="tile small">
+                        <div class="tl">Failed</div>
+                        <div class="tv fail" id="tasksFailed">0</div>
+                    </div>
+                    <div class="tile small">
+                        <div class="tl">Last task</div>
+                        <div class="tv" id="lastTask" style="font-size:13px;">&mdash;</div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Topology -->
+            <section class="panel col-7">
+                <h3>Hive Topology</h3>
+                <svg id="networkSvg"></svg>
+                <div class="legend">
+                    <span><i class="self"></i> This node</span>
+                    <span><i class="conn"></i> Open data channel</span>
+                    <span><i class="idle"></i> Signaling only</span>
+                </div>
+            </section>
+
+            <!-- Health -->
+            <section class="panel col-5">
+                <h3>Fault Tolerance</h3>
+                <div class="health-line">
+                    <span class="health-indicator healthy" id="healthIndicator"></span>
+                    <div>
+                        <div id="healthStatus">Healthy</div>
+                        <div id="connectionState">Connecting&hellip;</div>
+                    </div>
+                </div>
+                <div class="kv">
+                    <div class="row"><span class="k">Open data channels</span><span class="v" id="openChannels">0</span></div>
+                </div>
+                <button class="sim-btn" id="simulateFailureBtn" onclick="simulateWorkerFailure()">
+                    🧪 Simulate worker failure
+                </button>
+            </section>
+
+            <!-- Compute history -->
+            <section class="panel col-7">
+                <h3>Compute History</h3>
+                <div id="computeHistory" class="pane">
+                    <div class="history-message">No compute tasks received yet&hellip;</div>
+                </div>
+            </section>
+
+            <!-- Fault events -->
+            <section class="panel col-5">
+                <h3>Event Log</h3>
+                <div id="faultToleranceEvents" class="pane">
+                    <div class="history-message">No fault tolerance events yet&hellip;</div>
+                </div>
+            </section>
+
+            <!-- Allocation -->
+            <section class="panel col-12">
+                <h3>Resource Allocation</h3>
+                <div id="allocationSummary">
+                    <div class="history-message">Waiting for allocation data&hellip;</div>
+                </div>
+            </section>
         </div>
     </div>
 

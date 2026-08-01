@@ -1,5 +1,14 @@
 // Worker Node - receives compute tasks and WASM modules from master via WebRTC
-const SIGNALING_URL = "ws://localhost:3000";
+
+// Signaling endpoint. A hosted page joins a remote hive via ?server=, e.g.
+//   ?server=wss://hive.example/ws   or   ?server=192.168.1.10:3000
+// A bare host:port gets a scheme matching the page (wss when served over https).
+const SIGNALING_URL = (() => {
+    const raw = new URLSearchParams(location.search).get("server");
+    if (!raw) return "ws://localhost:3000";
+    if (/^wss?:\/\//i.test(raw)) return raw;
+    return (location.protocol === "https:" ? "wss://" : "ws://") + raw;
+})();
 let ws = null; // (re)created by connectSignaling()
 let myId;
 let peerConnections = {}; // { peerId: RTCPeerConnection }
@@ -32,7 +41,9 @@ let failedWorkers = new Set(); // Peers whose data channel errored while still l
 // dashboard stay responsive during compute.
 const EXEC_POOL_SIZE = Math.min(navigator.hardwareConcurrency || 2, 4);
 let execPool = []; // [{ worker, objectUrl, inFlight, loadedHashes: Set }]
-let pendingExecTasks = {}; // { taskId: { header, channel, entry, inputLen } }
+let pendingExecTasks = {}; // { taskId: { header, channel, entry, inputLen, dispatchedAt } }
+let lastTaskInfo = null; // { fn, ms } of the most recent completed task
+let completionTimes = []; // performance.now() of recent completions (throughput window)
 
 // SVG topology elements
 const networkSvg = document.getElementById("networkSvg");
@@ -566,6 +577,17 @@ function updateComputeHistoryDisplay() {
 }
 
 // ===== Network Topology Rendering =====
+
+// Pointy-top hexagon vertex list for an SVG <polygon> (honeycomb cells).
+function hexPoints(cx, cy, r) {
+    const pts = [];
+    for (let k = 0; k < 6; k++) {
+        const a = (Math.PI / 180) * (-90 + 60 * k);
+        pts.push((cx + r * Math.cos(a)).toFixed(1) + "," + (cy + r * Math.sin(a)).toFixed(1));
+    }
+    return pts.join(" ");
+}
+
 function drawNetwork(peers) {
     if (!networkSvg) return;
 
@@ -592,7 +614,7 @@ function drawNetwork(peers) {
         };
     });
 
-    // Draw only real edges: a solid line from this worker to each peer whose
+    // Draw only real edges: an amber line from this worker to each peer whose
     // data channel is actually open. No fabricated peer-to-peer mesh.
     const self = positions[myId];
     if (self) {
@@ -605,62 +627,56 @@ function drawNetwork(peers) {
             line.setAttribute("y1", self.y);
             line.setAttribute("x2", b.x);
             line.setAttribute("y2", b.y);
-            line.setAttribute("stroke", "#87CEEB");
+            line.setAttribute("stroke", "#f6b73c");
             line.setAttribute("stroke-width", "2");
-            line.setAttribute("stroke-opacity", "0.8");
+            line.setAttribute("stroke-opacity", "0.7");
             networkSvg.appendChild(line);
         });
     }
 
-    // Draw nodes
+    // Draw nodes as honeycomb cells (pointy-top hexagons).
     peers.forEach((id) => {
         const pos = positions[id];
         const isSelf = id === myId;
         const group = document.createElementNS("http://www.w3.org/2000/svg", "g");
 
-        // Node circle
-        const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
-        circle.setAttribute("cx", pos.x);
-        circle.setAttribute("cy", pos.y);
-        circle.setAttribute("r", isSelf ? "16" : "12");
-        circle.setAttribute("fill", isSelf ? "#90EE90" : "#ffffff22");
-        circle.setAttribute("stroke", isSelf ? "#32CD32" : "#FFFFFF55");
-        circle.setAttribute("stroke-width", isSelf ? "3" : "2");
+        const r = isSelf ? 17 : 13;
+        const hex = document.createElementNS("http://www.w3.org/2000/svg", "polygon");
+        hex.setAttribute("points", hexPoints(pos.x, pos.y, r));
 
-        // Peers known only via signaling (no open channel) render dashed
-        if (!isSelf && !connectedPeers[id]) {
-            circle.setAttribute("stroke-dasharray", "4 3");
-            circle.setAttribute("fill-opacity", "0.45");
+        // Default: an idle cell (charcoal fill, faint outline).
+        let fill = "#ffffff10";
+        let stroke = "#ffffff40";
+        let strokeWidth = isSelf ? 3 : 2;
+
+        if (failedWorkers.has(id)) {
+            fill = "#ff6b6b33"; stroke = "#ff6b6b"; strokeWidth = 3;
+        } else if (isSelf) {
+            if (workerHealth === "failed") { fill = "#ff6b6b44"; stroke = "#ff6b6b"; }
+            else if (workerHealth === "recovering" || workerHealth === "connecting") { fill = "#ffd93d33"; stroke = "#ffd93d"; }
+            else { fill = "#f6b73c"; stroke = "#ffd27a"; } // healthy self: solid honey
+        } else if (connectedPeers[id]) {
+            fill = "#86e0a01f"; stroke = "#86e0a0"; // open data channel: green cell
         }
 
-        // Label
+        hex.setAttribute("fill", fill);
+        hex.setAttribute("stroke", stroke);
+        hex.setAttribute("stroke-width", strokeWidth);
+        // Peers known only via signaling (no open channel) render dashed.
+        if (!isSelf && !connectedPeers[id] && !failedWorkers.has(id)) {
+            hex.setAttribute("stroke-dasharray", "4 3");
+        }
+
         const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
         label.setAttribute("x", pos.x);
-        label.setAttribute("y", pos.y + (isSelf ? 30 : 26));
-        label.setAttribute("fill", "#ffffffcc");
-        label.setAttribute("font-size", "12");
+        label.setAttribute("y", pos.y + (isSelf ? 32 : 28));
+        label.setAttribute("fill", isSelf ? "#ffd27a" : "#9c927c");
+        label.setAttribute("font-size", "11");
         label.setAttribute("text-anchor", "middle");
-        label.setAttribute("font-family", "'Segoe UI', Tahoma, Geneva, Verdana, sans-serif");
+        label.setAttribute("font-family", '"SF Mono", "JetBrains Mono", Menlo, Consolas, monospace');
         label.textContent = id;
 
-        // Color code based on health status
-        if (failedWorkers.has(id)) {
-            circle.setAttribute("fill", "#FF6B6B");
-            circle.setAttribute("stroke", "#FF4444");
-            circle.setAttribute("stroke-width", "3");
-        } else if (isSelf && workerHealth === "failed") {
-            circle.setAttribute("fill", "#FF6B6B");
-            circle.setAttribute("stroke", "#FF4444");
-        } else if (isSelf && (workerHealth === "recovering" || workerHealth === "connecting")) {
-            circle.setAttribute("fill", "#FFD93D");
-            circle.setAttribute("stroke", "#FFB800");
-        } else if (isSelf) {
-            // Healthy - keep default green
-            circle.setAttribute("fill", "#90EE90");
-            circle.setAttribute("stroke", "#32CD32");
-        }
-
-        group.appendChild(circle);
+        group.appendChild(hex);
         group.appendChild(label);
         networkSvg.appendChild(group);
     });
@@ -879,10 +895,11 @@ function dispatchToExecWorker(header, channel, input) {
         msg.module = { hash: header.module_hash, wasm: raw.wasm, glue: raw.glue };
         entry.loadedHashes.add(header.module_hash); // optimistic; moduleFailed reverts
     }
-    pendingExecTasks[header.task_id] = { header, channel, entry, inputLen };
+    pendingExecTasks[header.task_id] = { header, channel, entry, inputLen, dispatchedAt: performance.now() };
     entry.inFlight++;
     tasksRunning++;
     updateHealthStatus();
+    renderExecStats();
     entry.worker.postMessage(msg, transfer);
 }
 
@@ -902,7 +919,10 @@ function handleExecMessage(entry, msg) {
     if (msg.ok) {
         const result = new Uint8Array(msg.bytes);
         tasksCompleted++;
+        lastTaskInfo = { fn: header.map_function, ms: Math.round(performance.now() - pending.dispatchedAt) };
+        completionTimes.push(performance.now());
         updateHealthStatus();
+        renderExecStats();
         addToComputeHistory({
             taskId: header.task_id,
             dataChunk: [inputLen],
@@ -915,6 +935,7 @@ function handleExecMessage(entry, msg) {
         tasksFailed++;
         addFaultToleranceEvent("failure", `Task ${header.task_id} failed: ${msg.error}`);
         updateHealthStatus();
+        renderExecStats();
         sendErrorResultFrame(channel, header, msg.error);
         // A fatal wasm trap leaves the worker's instances unreliable; respawn it.
         if (msg.fatal) respawnExecWorker(entry, "exec worker hit a wasm trap");
@@ -939,7 +960,57 @@ function respawnExecWorker(entry, reason) {
     try { entry.worker.terminate(); } catch (e) { /* already gone */ }
     try { URL.revokeObjectURL(entry.objectUrl); } catch (e) { /* already revoked */ }
     updateHealthStatus();
+    renderExecStats();
     // A fresh worker spawns lazily on the next pickExecEntry (pool now under cap).
+}
+
+// Repaint the live compute-telemetry tiles (throughput, pool, last task).
+function renderExecStats() {
+    const now = (typeof performance !== "undefined" ? performance.now() : Date.now());
+    completionTimes = completionTimes.filter((t) => now - t < 5000);
+    const rate = completionTimes.length / 5;
+
+    const tp = document.getElementById("throughput");
+    if (tp) tp.textContent = rate.toFixed(1);
+
+    const ps = document.getElementById("poolStatus");
+    if (ps) {
+        ps.textContent = execPool.length === 0
+            ? "idle"
+            : `${execPool.length}/${EXEC_POOL_SIZE} · ${Object.keys(rawModuleCache).length} mod`;
+    }
+
+    const lt = document.getElementById("lastTask");
+    if (lt) lt.textContent = lastTaskInfo ? `${lastTaskInfo.fn} · ${lastTaskInfo.ms}ms` : "—";
+
+    const rt = document.getElementById("runningTile");
+    if (rt) rt.classList.toggle("live", tasksRunning > 0);
+}
+
+// ===== Shareable join link =====
+function populateJoinInfo() {
+    const link = document.getElementById("joinLink");
+    if (link) link.value = location.href;
+    const label = document.getElementById("serverLabel");
+    if (label) label.textContent = SIGNALING_URL;
+}
+
+function copyJoinLink() {
+    const el = document.getElementById("joinLink");
+    if (!el) return;
+    el.select();
+    const flash = () => {
+        const btn = document.getElementById("copyLinkBtn");
+        if (!btn) return;
+        const prev = btn.textContent;
+        btn.textContent = "Copied";
+        setTimeout(() => { btn.textContent = prev; }, 1200);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(el.value).then(flash).catch(() => { try { document.execCommand("copy"); flash(); } catch (e) {} });
+    } else {
+        try { document.execCommand("copy"); flash(); } catch (e) {}
+    }
 }
 
 // ===== Module cache (raw bytes, content-hash keyed, pulled from the master) =====
@@ -1202,7 +1273,12 @@ function simulateWorkerFailure() {
 
 // Initialize on load
 function initWorker() {
+    populateJoinInfo();
     updateHealthStatus();
+    renderExecStats();
+    // Repaint telemetry on a light cadence so throughput decays after a job
+    // and the "running" tile reflects live state.
+    setInterval(renderExecStats, 1000);
     connectSignaling();
 }
 
